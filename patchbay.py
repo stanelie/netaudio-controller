@@ -620,7 +620,11 @@ class PatchBayTable(QTableWidget):
             for ci, tx_e in enumerate(self._tx_struct):
                 row = ri + 1
                 col = ci + 1
-                if rx_e['kind'] == 'chan' and tx_e['kind'] == 'chan':
+                same_device = (
+                    rx_e['kind'] == 'chan' and tx_e['kind'] == 'chan'
+                    and rx_e['device'].name == tx_e['device'].name
+                )
+                if rx_e['kind'] == 'chan' and tx_e['kind'] == 'chan' and not same_device:
                     self._make_conn_cell(row, col, rx_e, tx_e)
                 else:
                     it = QTableWidgetItem()
