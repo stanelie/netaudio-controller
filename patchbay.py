@@ -4,6 +4,7 @@
 import sys
 import asyncio
 import time
+import logging
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -27,6 +28,8 @@ from netaudio.dante.services.notification import (
     NOTIFICATION_ROUTING_READY,
 )
 from netaudio.common.app_config import settings as netaudio_settings
+
+log = logging.getLogger("patchbay")
 
 # Notification IDs that signal a routing/subscription change on a device.
 _ROUTING_NOTIFICATION_IDS = {
@@ -249,7 +252,9 @@ class DiscoveryWorker(QThread):
     async def _discover(self):
         app = _engine.app
         devices = None if self._force_full else await get_devices_from_daemon()
+        source = "daemon-cache"
         if devices is None:
+            source = "ARC full-query"
             devices = await app.discover_and_populate(
                 timeout=netaudio_settings.mdns_timeout
             )
@@ -280,7 +285,26 @@ class DiscoveryWorker(QThread):
             # already written by a running DeviceRefreshWorker.
             devices = app.devices
 
-        return devices or {}
+        devices = devices or {}
+        log.debug("[discover] source=%s  devices=%d", source, len(devices))
+        for sn, d in devices.items():
+            tx_chs = list(d.tx_channels.keys()) if d.tx_channels else []
+            rx_chs = list(d.rx_channels.keys()) if d.rx_channels else []
+            log.debug(
+                "  device sn=%s name=%r ip=%s  tx_channels=%s  rx_channels=%s  subscriptions=%d",
+                sn, d.name, getattr(d, 'ipv4', '?'),
+                tx_chs, rx_chs, len(d.subscriptions),
+            )
+            for sub in d.subscriptions:
+                log.debug(
+                    "    sub: rx_dev=%r rx_ch=%r  tx_dev=%r tx_ch=%r  "
+                    "status=0x%04x rx_ch_status=0x%04x",
+                    sub.rx_device_name, sub.rx_channel_name,
+                    sub.tx_device_name, sub.tx_channel_name,
+                    sub.status_code or 0,
+                    sub.rx_channel_status_code or 0,
+                )
+        return devices
 
 
 # ── Single-device refresh worker ──────────────────────────────────────────────
@@ -307,13 +331,27 @@ class DeviceRefreshWorker(QThread):
         app = _engine.app
         device = app.devices.get(self._server_name)
         if device is None:
+            log.debug("[device-refresh] server_name=%r not in app.devices — skipping", self._server_name)
             return app.devices
         arc_port = app.get_arc_port(device)
+        log.debug("[device-refresh] refreshing %r  ip=%s  arc_port=%s", self._server_name, getattr(device, 'ipv4', '?'), arc_port)
         if arc_port:
             try:
                 await app.arc.get_controls(device, arc_port)
-            except Exception:
-                pass
+                log.debug("[device-refresh] get_controls OK for %r  subscriptions=%d", self._server_name, len(device.subscriptions))
+                for sub in device.subscriptions:
+                    log.debug(
+                        "  sub: rx_dev=%r rx_ch=%r  tx_dev=%r tx_ch=%r  "
+                        "status=0x%04x rx_ch_status=0x%04x",
+                        sub.rx_device_name, sub.rx_channel_name,
+                        sub.tx_device_name, sub.tx_channel_name,
+                        sub.status_code or 0,
+                        sub.rx_channel_status_code or 0,
+                    )
+            except Exception as exc:
+                log.warning("[device-refresh] get_controls FAILED for %r: %s", self._server_name, exc)
+        else:
+            log.warning("[device-refresh] no ARC port for %r — cannot refresh", self._server_name)
         return app.devices
 
 
@@ -413,6 +451,15 @@ class PatchBayTable(QTableWidget):
                             sub.tx_device_name, sub.tx_channel_name,
                             sub.status_code, sub.rx_channel_status_code or 0,
                         )
+                    else:
+                        log.debug("[load] sub skipped (no tx): rx_dev=%r rx_ch=%r  tx_dev=%r tx_ch=%r",
+                                  sub.rx_device_name, sub.rx_channel_name,
+                                  sub.tx_device_name, sub.tx_channel_name)
+
+        log.debug("[load] _conns built: %d connection(s)", len(self._conns))
+        for k, v in self._conns.items():
+            log.debug("  conn: rx_dev=%r rx_ch=%r  ->  tx_dev=%r tx_ch=%r  status=0x%04x rx_ch_status=0x%04x",
+                      k[0], k[1], v[0], v[1], v[2] or 0, v[3])
 
         self._rebuild()
 
@@ -660,14 +707,19 @@ class PatchBayTable(QTableWidget):
                             sub.status_code, sub.rx_channel_status_code or 0,
                         )
 
-        # Compare current channel fingerprint to detect structural changes
+        # Compare current channel fingerprint to detect structural changes.
+        # Both sides must be derived from the full device set (not from
+        # _rx_struct/_tx_struct which only contain *expanded* rows) so that
+        # collapsed devices don't create a spurious mismatch on every cycle.
         old_tx = frozenset(
-            (e['device'].name, e['channel'].number)
-            for e in self._tx_struct if e['kind'] == 'chan'
+            (d.name, ch.number)
+            for d in self._last_devices.values()
+            for ch in d.tx_channels.values()
         )
         old_rx = frozenset(
-            (e['device'].name, e['channel'].number)
-            for e in self._rx_struct if e['kind'] == 'chan'
+            (d.name, ch.number)
+            for d in self._last_devices.values()
+            for ch in d.rx_channels.values()
         )
         new_tx = frozenset(
             (d.name, ch.number)
@@ -680,10 +732,18 @@ class PatchBayTable(QTableWidget):
             for ch in d.rx_channels.values()
         )
 
+        log.debug("[sync] new_conns: %d connection(s)", len(new_conns))
+        for k, v in new_conns.items():
+            log.debug("  conn: rx_dev=%r rx_ch=%r  ->  tx_dev=%r tx_ch=%r  status=0x%04x rx_ch_status=0x%04x",
+                      k[0], k[1], v[0], v[1], v[2] or 0, v[3])
+
         self._last_devices = devices
         self._conns = new_conns
 
         if old_tx != new_tx or old_rx != new_rx:
+            log.debug("[sync] structural change detected — full rebuild")
+            log.debug("  old_tx=%s  new_tx=%s", sorted(old_tx), sorted(new_tx))
+            log.debug("  old_rx=%s  new_rx=%s", sorted(old_rx), sorted(new_rx))
             self._rebuild()                  # device set changed — full grid rebuild
         else:
             self._sync_cells(new_conns)      # same devices — repaint dots only
@@ -755,6 +815,14 @@ class PatchBayTable(QTableWidget):
                 now_error = now_connected and bool(now_rx_ch_status) and not (now_rx_ch_status & 0x0001)
 
                 if data['connected'] != now_connected or data.get('error') != now_error:
+                    log.debug(
+                        "[sync-cells] key=%r tx=%r  connected: %s->%s  error: %s->%s  "
+                        "rx_ch_status=0x%04x",
+                        key, (tx_dev.name, tx_name),
+                        data['connected'], now_connected,
+                        data.get('error'), now_error,
+                        now_rx_ch_status,
+                    )
                     data['connected'] = now_connected
                     data['error'] = now_error
                     it.setData(Qt.ItemDataRole.UserRole, data)
@@ -952,6 +1020,7 @@ class PatchBayWindow(QMainWindow):
         # 1. Notification-level: called for specific ARC notification IDs.
         async def _on_routing_notification(event):
             server_name = event.server_name or event.device_name
+            log.debug("[notification] routing notification  server=%r  event=%r", server_name, event)
             if server_name:
                 self._notify_refresh.emit(server_name)
 
@@ -969,13 +1038,18 @@ class PatchBayWindow(QMainWindow):
             if notification_id not in _ROUTING_NOTIFICATION_IDS:
                 return
             server_name = event.server_name or event.device_name
+            source_ip = event.data.get("source_ip", "")
+            log.debug("[notification] raw  id=0x%04x  server=%r  source_ip=%r",
+                      notification_id or 0, server_name, source_ip)
             if not server_name:
-                source_ip = event.data.get("source_ip", "")
                 if source_ip:
                     for sn, d in app.devices.items():
                         if d.ipv4 and str(d.ipv4) == source_ip:
                             server_name = sn
+                            log.debug("[notification] resolved ip=%r -> server=%r", source_ip, server_name)
                             break
+                if not server_name:
+                    log.warning("[notification] could not resolve server_name for ip=%r — refresh skipped", source_ip)
             if server_name:
                 self._notify_refresh.emit(server_name)
 
@@ -985,6 +1059,7 @@ class PatchBayWindow(QMainWindow):
         #    service calls after applying pending notifications.
         async def _on_device_updated(event):
             server_name = event.server_name or event.device_name
+            log.debug("[notification] DEVICE_UPDATED  server=%r", server_name)
             if server_name:
                 self._notify_refresh.emit(server_name)
 
@@ -1076,7 +1151,19 @@ class PatchBayWindow(QMainWindow):
 
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
+    import argparse
+    parser = argparse.ArgumentParser(description="Dante Patch Bay")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Enable debug logging to stderr")
+    args, qt_args = parser.parse_known_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    app = QApplication([sys.argv[0]] + qt_args)
     app.setStyle("Fusion")
     win = PatchBayWindow()
     win.show()
