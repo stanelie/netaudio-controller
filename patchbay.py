@@ -107,6 +107,30 @@ class DotDelegate(QStyledItemDelegate):
             return
 
         data = index.data(Qt.ItemDataRole.UserRole)
+        if isinstance(data, dict) and data.get("kind") == "rx_ch":
+            super().paint(painter, option, index)
+            status = data.get("status")
+            if status is not None:
+                painter.save()
+                r = option.rect
+                size = min(r.width(), r.height()) * 0.28
+                margin = 4
+                cx = r.right() - margin - size
+                cy = r.y() + r.height() / 2
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                if status == "ok":
+                    painter.setBrush(QBrush(C_CONN))
+                    painter.setPen(QPen(QColor(30, 130, 45), 1.5))
+                else:
+                    painter.setBrush(QBrush(C_ERROR))
+                    painter.setPen(QPen(QColor(150, 20, 20), 1.5))
+                painter.drawEllipse(
+                    int(cx - size), int(cy - size),
+                    int(size * 2), int(size * 2),
+                )
+                painter.restore()
+            return
+
         if not (isinstance(data, dict) and data.get("kind") == "conn"):
             super().paint(painter, option, index)
             return
@@ -503,7 +527,45 @@ class PatchBayTable(QTableWidget):
                     align=left, flags=Qt.ItemFlag.NoItemFlags,
                 )
                 it.setToolTip(f"{entry['dname']}  /  {lbl}")
+                it.setData(Qt.ItemDataRole.UserRole, {
+                    'kind': 'rx_ch',
+                    'status': self._get_rx_status(entry['dname'], ch.name),
+                })
             self.setItem(row, 0, it)
+
+    def _get_rx_status(self, rx_dev_name: str, rx_ch_name: str):
+        """Returns None (unpatched), 'ok', or 'error' for the given RX channel."""
+        key = (rx_dev_name, rx_ch_name)
+        if key in self._user_set_conns:
+            expected, expiry = self._user_set_conns[key]
+            if time.monotonic() <= expiry:
+                return None if expected is None else 'ok'
+        conn_data = self._conns.get(key)
+        if conn_data is None:
+            return None
+        rx_ch_status = conn_data[3] or 0
+        error = bool(rx_ch_status) and not (rx_ch_status & 0x0001)
+        return 'error' if error else 'ok'
+
+    def _update_rx_header_status(self) -> bool:
+        """Refresh the status dot stored in every RX channel header cell (col 0).
+        Returns True if any cell changed."""
+        changed = False
+        for ri, rx_e in enumerate(self._rx_struct):
+            if rx_e['kind'] != 'chan':
+                continue
+            it = self.item(ri + 1, 0)
+            if it is None:
+                continue
+            d = it.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(d, dict) or d.get('kind') != 'rx_ch':
+                continue
+            new_status = self._get_rx_status(rx_e['dname'], rx_e['channel'].name)
+            if d.get('status') != new_status:
+                d['status'] = new_status
+                it.setData(Qt.ItemDataRole.UserRole, d)
+                changed = True
+        return changed
 
     def _fill_cells(self):
         no_flags = Qt.ItemFlag.NoItemFlags
@@ -698,6 +760,8 @@ class PatchBayTable(QTableWidget):
                     it.setData(Qt.ItemDataRole.UserRole, data)
                     changed = True
 
+        if self._update_rx_header_status():
+            changed = True
         if changed:
             self.viewport().update()
 
@@ -813,6 +877,7 @@ class PatchBayTable(QTableWidget):
             self.status.emit(f"Error: {msg}")
 
         it.setData(Qt.ItemDataRole.UserRole, data)
+        self._update_rx_header_status()
         self.viewport().update()
 
 
