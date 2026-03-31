@@ -9,7 +9,7 @@ import logging
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QCheckBox, QStatusBar, QAbstractItemView, QStyledItemDelegate,
-    QTableWidget, QTableWidgetItem, QTabWidget,
+    QTableWidget, QTableWidgetItem,
 )
 from PyQt6.QtCore import Qt, QRect, QThread, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QColor, QFont, QBrush, QPainter, QPen
@@ -393,73 +393,6 @@ class CmdWorker(QThread):
             await _engine.app.arc.request(
                 packet, ip, port, logical_command_name="patch_bay"
             )
-
-
-# ── Clock leader command worker ────────────────────────────────────────────────
-class ClockSetLeaderWorker(QThread):
-    """Sends a preferred-master (clock leader) command to a single device."""
-    done = pyqtSignal(bool, str)
-
-    def __init__(self, device, value: bool):
-        super().__init__()
-        self._device = device
-        self._value  = value
-
-    def run(self):
-        future = _engine.submit(self._send())
-        try:
-            future.result(timeout=10)
-            self.done.emit(True, "")
-        except Exception as exc:
-            self.done.emit(False, str(exc))
-
-    async def _send(self):
-        cmds = DanteDeviceCommands()
-        ip   = str(self._device.ipv4)
-
-        packet, _, port = cmds.command_set_preferred_leader(self._value)
-        result = await device_request_via_daemon(packet, ip, port)
-        if result is None:
-            await _engine.app.settings.request(
-                packet, ip, port, logical_command_name="clock_leader"
-            )
-
-
-# ── Clock status fetch worker ─────────────────────────────────────────────────
-class ClockRefreshWorker(QThread):
-    """Calls get_clocking_status() on every device to populate clock fields.
-
-    Operates on the device objects already held by ClockStatusTab (the same
-    dict reference) so that written fields are immediately visible to the tab.
-    """
-    done = pyqtSignal(dict)
-
-    def __init__(self, devices: dict):
-        super().__init__()
-        self._devices = devices   # same objects the tab holds — no key mismatch
-
-    def run(self):
-        future = _engine.submit(self._fetch())
-        try:
-            self.done.emit(future.result(timeout=30))
-        except Exception as exc:
-            print(f"[clock-refresh] worker top-level exception: {exc!r}")
-
-    async def _fetch(self):
-        app = _engine.app
-
-        async def _probe_one(sn, ip):
-            try:
-                await app.probe_preferred_leader_state(ip, timeout=1.5)
-            except Exception as exc:
-                log.debug("[clock-refresh] probe failed for %r (%s): %s", sn, ip, exc)
-
-        ips = [(sn, str(device.ipv4))
-               for sn, device in self._devices.items()
-               if getattr(device, 'ipv4', None)]
-        # Probe all devices concurrently so total time ≈ one round-trip, not N×timeout.
-        await asyncio.gather(*(_probe_one(sn, ip) for sn, ip in ips))
-        return self._devices
 
 
 # ── Patch bay table ────────────────────────────────────────────────────────────
@@ -1020,455 +953,10 @@ class PatchBayTable(QTableWidget):
         self.viewport().update()
 
 
-# ── Clock status tab ───────────────────────────────────────────────────────────
-C_PENDING_ROW = QColor(255, 248, 215)   # pale amber  — change in flight
-C_CONFIRM_ROW = QColor(220, 245, 220)   # pale green  — just confirmed
-C_ERROR_ROW   = QColor(255, 220, 220)   # pale red    — could not confirm
-C_CLOCK_FG    = QColor(25,  25,  25)    # near-black text for clock tab cells
-
-import tempfile as _tempfile, os as _os
-
-def _write_tick_svg():
-    svg = (
-        b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
-        b'<polyline points="1,5 4,8.5 9,1.5" fill="none" stroke="#191919"'
-        b' stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>'
-        b'</svg>'
-    )
-    fd, path = _tempfile.mkstemp(suffix='.svg')
-    _os.write(fd, svg)
-    _os.close(fd)
-    return path
-
-_TICK_SVG_PATH = _write_tick_svg()
-_CHECKBOX_STYLE = f"""
-    QCheckBox::indicator {{
-        width: 13px; height: 13px;
-        border: 1.5px solid #191919;
-        border-radius: 2px;
-        background-color: white;
-    }}
-    QCheckBox::indicator:checked {{
-        background-color: white;
-        border: 1.5px solid #191919;
-        image: url("{_TICK_SVG_PATH}");
-    }}
-"""
-
-
-class ClockStatusTab(QWidget):
-    """Tab listing devices with their PTP clock role and a 'Preferred Leader' checkbox.
-
-    Checkbox behaviour
-    ──────────────────
-    • Reflects the network state at all times (via ``sync()``).
-    • When the user toggles a checkbox the command is sent immediately and the
-      row turns amber to signal a pending change.
-    • A background worker re-queries the device after ``_VERIFY_DELAY_MS`` ms.
-      – If the device confirms the new state the row flashes green, then clears.
-      – If the TTL expires without confirmation the row flashes red, the checkbox
-        reverts to the previous value, and the pending state is cleared.
-      – If still not confirmed but within the TTL the verification is rescheduled.
-    """
-
-    status = pyqtSignal(str)
-
-    _VERIFY_DELAY_MS = 4_000   # ms between re-query attempts
-    _CHANGE_TTL      = 15      # s  — give up and revert after this long
-
-    COL_NAME   = 0
-    COL_IP     = 1
-    COL_LEADER = 2
-    COL_ROLE   = 3
-    _HEADERS   = ["Device", "IP Address", "Preferred Leader", "Clock Role"]
-
-    def __init__(self):
-        super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
-
-        self._table = QTableWidget()
-        self._table.setColumnCount(len(self._HEADERS))
-        self._table.setHorizontalHeaderLabels(self._HEADERS)
-        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self._table.verticalHeader().setVisible(False)
-        self._table.setShowGrid(True)
-        self._table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self._table)
-
-        self._devices: dict = {}              # sn → device
-        # sn → (intended_bool, expiry_monotonic, flash_colour | None)
-        self._pending: dict = {}
-        self._workers: list = []
-        self._verify_timers: dict[str, QTimer] = {}
-
-    # ── Public interface (called by PatchBayWindow) ────────────────────────────
-
-    @property
-    def devices(self) -> dict:
-        """The device dict currently held by this tab."""
-        return self._devices
-
-    def load(self, devices: dict):
-        """Full rebuild from a fresh discovery result."""
-        self._devices = devices
-        self._rebuild()
-
-    def sync(self, devices: dict):
-        """Merge fresh data without full rebuild; validates pending changes."""
-        now = time.monotonic()
-        for sn in list(self._pending.keys()):
-            intended, expiry, flash = self._pending[sn]
-            device = devices.get(sn)
-            if device is None:
-                continue
-            actual = getattr(device, 'preferred_leader', None)
-            if actual is not None and bool(actual) == intended:
-                # Confirmed by network — flash green, then clear
-                self._pending[sn] = (intended, expiry, C_CONFIRM_ROW)
-                QTimer.singleShot(1500, lambda s=sn: self._clear_pending(s))
-
-        # If this is the same dict object (e.g. emitted by ClockRefreshWorker
-        # after in-place mutation), just repaint — don't replace or compare keys.
-        if devices is not self._devices:
-            old_sns = set(self._devices.keys())
-            self._devices = devices
-            new_sns = set(devices.keys())
-            if old_sns != new_sns:
-                self._rebuild()
-                return
-
-        self._update_rows()
-
-    # ── Build / update table ───────────────────────────────────────────────────
-
-    def _sorted_items(self) -> list:
-        return sorted(
-            self._devices.items(),
-            key=lambda kv: (kv[1].name or kv[0]).lower()
-        )
-
-    def _rebuild(self):
-        self._table.setRowCount(0)
-        items = self._sorted_items()
-        self._table.setRowCount(len(items))
-        for row, (sn, device) in enumerate(items):
-            self._fill_row(row, sn, device)
-        self._table.resizeColumnsToContents()
-        self._table.setColumnWidth(self.COL_LEADER, 130)
-
-    def _fill_row(self, row: int, sn: str, device):
-        dev_name = device.name or sn
-        ip_str   = str(device.ipv4) if getattr(device, 'ipv4', None) else "—"
-        pm       = getattr(device, 'preferred_leader', None)
-
-        # ── DEBUG ──────────────────────────────────────────────────────────────
-        # Dump every attribute of the device object so we can find the real
-        # clock-related field names regardless of library version.
-        clock_attrs = {
-            k: getattr(device, k)
-            for k in dir(device)
-            if not k.startswith('_') and any(
-                kw in k.lower()
-                for kw in ('clock', 'master', 'leader', 'preferred', 'ptp',
-                           'sync', 'primary', 'domain', 'grandmaster')
-            )
-        }
-        print(f"[clock-debug] device={dev_name!r}  preferred_leader={pm!r}")
-        if clock_attrs:
-            for k, v in sorted(clock_attrs.items()):
-                print(f"  {k} = {v!r}")
-        else:
-            print(f"  (no clock-related attributes found)")
-        # ── END DEBUG ──────────────────────────────────────────────────────────
-
-        # Col 0: device name — stores sn in UserRole for later lookups
-        it = QTableWidgetItem(dev_name)
-        it.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        it.setData(Qt.ItemDataRole.UserRole, sn)
-        it.setForeground(QBrush(C_CLOCK_FG))
-        self._table.setItem(row, self.COL_NAME, it)
-
-        # Col 1: IP address
-        it = QTableWidgetItem(ip_str)
-        it.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        it.setForeground(QBrush(C_CLOCK_FG))
-        self._table.setItem(row, self.COL_IP, it)
-
-        # Col 2: Preferred Leader checkbox (widget-in-cell, centred)
-        self._set_leader_checkbox(row, sn, pm)
-
-        # Col 3: Clock role
-        it = QTableWidgetItem(self._clock_role(device))
-        it.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        it.setForeground(QBrush(C_CLOCK_FG))
-        self._table.setItem(row, self.COL_ROLE, it)
-
-        self._apply_row_colour(row, sn)
-
-    def _set_leader_checkbox(self, row: int, sn: str, pm):
-        """Create (or recreate) the Preferred Leader cell widget.
-
-        When pm is None the device does not support preferred-leader selection;
-        show a static 'Follower only' label instead of a checkbox.
-        """
-        container = QWidget()
-        hbox = QHBoxLayout(container)
-        hbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hbox.setContentsMargins(0, 0, 0, 0)
-
-        if pm is None:
-            from PyQt6.QtWidgets import QLabel
-            lbl = QLabel("Follower only")
-            lbl.setStyleSheet(f"color: rgb({C_CLOCK_FG.red()},{C_CLOCK_FG.green()},{C_CLOCK_FG.blue()});")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            hbox.addWidget(lbl)
-        else:
-            chk = QCheckBox()
-            chk.setStyleSheet(_CHECKBOX_STYLE)
-            chk.setChecked(bool(pm))
-            chk.setToolTip(
-                "This device is marked as the preferred network clock leader."
-                if pm else
-                "Tick to designate this device as the preferred clock leader."
-            )
-            chk.stateChanged.connect(lambda state, s=sn: self._on_leader_toggled(s, state))
-            hbox.addWidget(chk)
-
-        self._table.setCellWidget(row, self.COL_LEADER, container)
-
-    def _update_rows(self):
-        """Repaint all rows from current ``_devices`` and ``_pending`` state."""
-        for row in range(self._table.rowCount()):
-            name_it = self._table.item(row, self.COL_NAME)
-            if name_it is None:
-                continue
-            sn     = name_it.data(Qt.ItemDataRole.UserRole)
-            device = self._devices.get(sn)
-            if device is None:
-                continue
-
-            # Update checkbox only when not waiting for confirmation
-            if sn not in self._pending:
-                pm        = getattr(device, 'preferred_leader', None)
-
-                # ── DEBUG ──────────────────────────────────────────────────────
-                clock_attrs = {
-                    k: getattr(device, k)
-                    for k in dir(device)
-                    if not k.startswith('_') and any(
-                        kw in k.lower()
-                        for kw in ('clock', 'master', 'leader', 'preferred',
-                                   'ptp', 'sync', 'primary', 'domain', 'grandmaster')
-                    )
-                }
-                print(f"[clock-sync] device={device.name or sn!r}  preferred_leader={pm!r}  "
-                      f"pending={sn in self._pending}")
-                for k, v in sorted(clock_attrs.items()):
-                    print(f"  {k} = {v!r}")
-                # ── END DEBUG ──────────────────────────────────────────────────
-
-                container = self._table.cellWidget(row, self.COL_LEADER)
-                has_checkbox = container is not None and container.findChild(QCheckBox) is not None
-                if pm is None and has_checkbox:
-                    # Device no longer reports preferred-leader — switch to label
-                    self._set_leader_checkbox(row, sn, pm)
-                elif pm is not None and not has_checkbox:
-                    # Device now reports preferred-leader — switch to checkbox
-                    self._set_leader_checkbox(row, sn, pm)
-                elif pm is not None and has_checkbox:
-                    chk = container.findChild(QCheckBox)
-                    chk.blockSignals(True)
-                    chk.setChecked(bool(pm))
-                    chk.blockSignals(False)
-
-            # Clock role text
-            role_it = self._table.item(row, self.COL_ROLE)
-            if role_it:
-                role_it.setText(self._clock_role(device))
-
-            self._apply_row_colour(row, sn)
-
-    def _clock_role(self, device) -> str:
-        """Best-effort clock role label from whatever attribute the library exposes."""
-        for attr in ('is_clock_master', 'clock_master', 'is_master'):
-            v = getattr(device, attr, None)
-            if v is True:
-                return "Leader"
-            if v is False:
-                return "Follower"
-        pm = getattr(device, 'preferred_leader', None)
-        if pm is True:
-            return "Preferred"
-        return "—"
-
-    def _apply_row_colour(self, row: int, sn: str):
-        if sn in self._pending:
-            _, _, flash = self._pending[sn]
-            colour = flash or C_PENDING_ROW
-        else:
-            colour = None
-        for col in (self.COL_NAME, self.COL_IP, self.COL_ROLE):
-            it = self._table.item(row, col)
-            if it:
-                if colour:
-                    it.setBackground(QBrush(colour))
-                else:
-                    it.setBackground(QBrush(QColor(Qt.GlobalColor.white)))
-                it.setForeground(QBrush(C_CLOCK_FG))
-        # The checkbox cell uses setCellWidget, so the item background has no
-        # effect — set the container widget's stylesheet instead.
-        container = self._table.cellWidget(row, self.COL_LEADER)
-        if container:
-            bg = colour.name() if colour else "#ffffff"
-            container.setStyleSheet(f"background-color: {bg};")
-
-    def _clear_pending(self, sn: str):
-        """Remove the pending entry and repaint the row to clear any flash colour."""
-        self._pending.pop(sn, None)
-        self._update_rows()
-
-    # ── Checkbox interaction ───────────────────────────────────────────────────
-
-    def _on_leader_toggled(self, sn: str, state: int):
-        if sn in self._pending:
-            return   # signal fired by our own blockSignals=False update — ignore
-        device = self._devices.get(sn)
-        if device is None:
-            return
-
-        new_val  = (state == Qt.CheckState.Checked.value)
-        dev_name = device.name or sn
-
-        print(f"[clock-toggle] device={dev_name!r}  new_val={new_val!r}  "
-              f"preferred_leader_before={getattr(device, 'preferred_leader', None)!r}")
-
-        # Record optimistic intent
-        self._pending[sn] = (new_val, time.monotonic() + self._CHANGE_TTL, None)
-        self._repaint_row_for(sn)
-
-        self.status.emit(
-            f"{'Enabling' if new_val else 'Disabling'} preferred leader on {dev_name}…"
-        )
-
-        # Fire the ARC command
-        w = ClockSetLeaderWorker(device, new_val)
-        w.done.connect(lambda ok, msg, s=sn, nv=new_val: self._cmd_done(ok, msg, s, nv))
-        self._workers = [x for x in self._workers if not x.isFinished()]
-        self._workers.append(w)
-        w.start()
-
-        # Schedule first verification pass
-        self._schedule_verify(sn)
-
-    def _cmd_done(self, ok: bool, msg: str, sn: str, new_val: bool):
-        device   = self._devices.get(sn)
-        dev_name = (device.name or sn) if device else sn
-        if ok:
-            self.status.emit(f"Clock leader command sent to {dev_name}.")
-        else:
-            # Hard failure — revert immediately without waiting for TTL
-            self.status.emit(f"Clock leader command failed for {dev_name}: {msg}")
-            self._pending.pop(sn, None)
-            self._revert_checkbox(sn)
-            self._repaint_row_for(sn)
-
-    # ── Verification ──────────────────────────────────────────────────────────
-
-    def _schedule_verify(self, sn: str):
-        """(Re-)arm the single-shot timer that triggers a device re-query."""
-        if sn in self._verify_timers:
-            t = self._verify_timers[sn]
-            if t.isActive():
-                t.stop()
-        timer = QTimer(self)
-        timer.setSingleShot(True)
-        timer.timeout.connect(lambda s=sn: self._run_verify(s))
-        timer.start(self._VERIFY_DELAY_MS)
-        self._verify_timers[sn] = timer
-
-    def _run_verify(self, sn: str):
-        if sn not in self._pending:
-            return
-        w = DeviceRefreshWorker(sn)
-        w.done.connect(lambda devices, s=sn: self._on_verify_done(devices, s))
-        self._workers = [x for x in self._workers if not x.isFinished()]
-        self._workers.append(w)
-        w.start()
-
-    def _on_verify_done(self, devices: dict, sn: str):
-        if sn not in self._pending:
-            return
-        intended, expiry, _ = self._pending[sn]
-        device = devices.get(sn)
-        now    = time.monotonic()
-
-        actual = getattr(device, 'preferred_leader', None) if device else None
-        print(f"[clock-verify] sn={sn!r}  intended={intended!r}  "
-              f"actual={actual!r}  ttl_remaining={expiry - now:.1f}s")
-
-        if device is not None:
-            actual = getattr(device, 'preferred_leader', None)
-            if actual is not None and bool(actual) == intended:
-                # ✓ Confirmed
-                dev_name = device.name or sn
-                self.status.emit(f"Preferred leader change confirmed for {dev_name}.")
-                self._devices[sn]  = device
-                self._pending[sn]  = (intended, expiry, C_CONFIRM_ROW)
-                QTimer.singleShot(1500, lambda s=sn: self._clear_pending(s))
-                self._update_rows()
-                return
-
-        if now > expiry:
-            # ✗ TTL elapsed — give up and revert
-            device   = self._devices.get(sn)
-            dev_name = (device.name or sn) if device else sn
-            self.status.emit(
-                f"Could not confirm preferred leader change for {dev_name} — reverting."
-            )
-            self._pending[sn] = (intended, expiry, C_ERROR_ROW)
-            self._revert_checkbox(sn)
-            QTimer.singleShot(2000, lambda s=sn: self._clear_pending(s))
-            return
-
-        # Still within TTL but not yet confirmed — reschedule
-        self._schedule_verify(sn)
-
-    def _revert_checkbox(self, sn: str):
-        """Set the checkbox back to the last known network value."""
-        device = self._devices.get(sn)
-        if device is None:
-            return
-        pm = getattr(device, 'preferred_leader', None)
-        for row in range(self._table.rowCount()):
-            it = self._table.item(row, self.COL_NAME)
-            if it and it.data(Qt.ItemDataRole.UserRole) == sn:
-                container = self._table.cellWidget(row, self.COL_LEADER)
-                if container:
-                    chk = container.findChild(QCheckBox)
-                    if chk:
-                        chk.blockSignals(True)
-                        chk.setChecked(bool(pm) if pm is not None else False)
-                        chk.blockSignals(False)
-                break
-
-    def _repaint_row_for(self, sn: str):
-        for row in range(self._table.rowCount()):
-            it = self._table.item(row, self.COL_NAME)
-            if it and it.data(Qt.ItemDataRole.UserRole) == sn:
-                self._apply_row_colour(row, sn)
-                break
-        self._table.viewport().update()
-
-
 # ── Main window ────────────────────────────────────────────────────────────────
 class PatchBayWindow(QMainWindow):
     # Signal emitted from the notification callback (async thread → Qt main thread)
     _notify_refresh = pyqtSignal(str)   # server_name of device that changed
-    _clock_status_received = pyqtSignal(str)  # source_ip of device whose clock state changed
 
     def __init__(self):
         super().__init__()
@@ -1477,49 +965,37 @@ class PatchBayWindow(QMainWindow):
 
         central = QWidget()
         self.setCentralWidget(central)
-        outer = QVBoxLayout(central)
-        outer.setContentsMargins(6, 6, 6, 6)
-        outer.setSpacing(4)
+        vbox = QVBoxLayout(central)
+        vbox.setContentsMargins(6, 6, 6, 6)
+        vbox.setSpacing(4)
 
-        # ── shared toolbar ────────────────────────────────────────────────────
         toolbar = QHBoxLayout()
         self._btn_refresh = QPushButton("⟳  Refresh")
         self._btn_refresh.setFixedWidth(110)
         self._btn_refresh.clicked.connect(self.refresh)
         toolbar.addWidget(self._btn_refresh)
+        self._chk_auto_update = QCheckBox("Auto-update")
+        self._chk_auto_update.setChecked(False)
+        self._chk_auto_update.toggled.connect(self._on_auto_update_toggled)
+        toolbar.addWidget(self._chk_auto_update)
         toolbar.addStretch()
-        outer.addLayout(toolbar)
+        vbox.addLayout(toolbar)
 
-        # ── tab widget ────────────────────────────────────────────────────────
-        self._tabs = QTabWidget()
-        outer.addWidget(self._tabs)
-
-        # Patch Bay tab
-        patch_widget = QWidget()
-        patch_layout = QVBoxLayout(patch_widget)
-        patch_layout.setContentsMargins(0, 0, 0, 0)
         self._table = PatchBayTable()
         self._table.status.connect(self._show_status)
         self._table.patched.connect(self._auto_refresh)
-        patch_layout.addWidget(self._table)
-        self._tabs.addTab(patch_widget, "Patch Bay")
-
-        # Clock Status tab
-        self._clock_tab = ClockStatusTab()
-        self._clock_tab.status.connect(self._show_status)
-        self._tabs.addTab(self._clock_tab, "Clock Status")
+        vbox.addWidget(self._table)
 
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
 
         self._discovery_worker: DiscoveryWorker | None = None
         self._bg_worker: DiscoveryWorker | None = None
-        self._clock_worker: ClockRefreshWorker | None = None
+        self._full_bg_worker: DiscoveryWorker | None = None
         self._all_workers: list = []
 
-        # Wire the cross-thread notification signals
+        # Wire the cross-thread notification signal
         self._notify_refresh.connect(self._on_device_notification)
-        self._clock_status_received.connect(self._on_clock_status_received)
         self._device_refresh_workers: dict[str, DeviceRefreshWorker] = {}
 
         # Start the persistent async engine and register notification handlers
@@ -1530,6 +1006,13 @@ class PatchBayWindow(QMainWindow):
         self._auto_timer.setInterval(5000)
         self._auto_timer.timeout.connect(self._auto_refresh)
         self._auto_timer.start()
+
+        # Periodic deep sync: bypass the daemon cache and re-query all devices
+        # via ARC every 30 seconds so the grid stays accurate after restarts,
+        # crosspoint changes from other controllers, etc.
+        self._full_refresh_timer = QTimer(self)
+        self._full_refresh_timer.setInterval(30_000)
+        self._full_refresh_timer.timeout.connect(self._full_bg_refresh)
 
         self.refresh()
 
@@ -1586,27 +1069,11 @@ class PatchBayWindow(QMainWindow):
 
         app.dispatcher.on(EventType.DEVICE_UPDATED, _on_device_updated)
 
-        # 4. PTP clock status broadcasts: the library's notification service
-        #    processes these CONMON packets (opcode 0x0020) via
-        #    _handle_ptp_clock_status, which updates device.preferred_leader and
-        #    device.ptp_v1_role directly but never dispatches a NOTIFICATION_RECEIVED
-        #    event.  Hook _notify_preferred_leader_waiter — called at the very end of
-        #    _handle_ptp_clock_status — to get an immediate signal on every broadcast
-        #    or probe response without any extra polling or network traffic.
-        _clock_signal = self._clock_status_received
-        _original_notify = app.notifications._notify_preferred_leader_waiter
-
-        def _hooked_notify(source_ip: str, preferred_leader):
-            _original_notify(source_ip, preferred_leader)
-            _clock_signal.emit(source_ip)
-
-        app.notifications._notify_preferred_leader_waiter = _hooked_notify
-
-    def _on_clock_status_received(self, source_ip: str):
-        """Called immediately (Qt main thread) when any device sends a PTP clock
-        status packet — both spontaneous broadcasts and probe responses.  The
-        device object is already updated by the time this fires."""
-        self._clock_tab.sync(self._clock_tab.devices)
+    def _on_auto_update_toggled(self, enabled: bool):
+        if enabled:
+            self._full_refresh_timer.start()
+        else:
+            self._full_refresh_timer.stop()
 
     # ── Notification-driven single-device refresh ──────────────────────────────
     def _on_device_notification(self, server_name: str):
@@ -1651,39 +1118,29 @@ class PatchBayWindow(QMainWindow):
         self._all_workers.append(w)
         w.start()
 
+    def _full_bg_refresh(self):
+        """Periodic deep sync: full discover_and_populate(), silently applied."""
+        if self._discovery_worker is not None and self._discovery_worker.isRunning():
+            return
+        if self._full_bg_worker is not None and self._full_bg_worker.isRunning():
+            return
+        w = DiscoveryWorker(force_full=True)
+        w.done.connect(self._on_bg_refresh)
+        self._full_bg_worker = w
+        self._all_workers.append(w)
+        w.start()
+
     def _on_bg_refresh(self, devices: dict):
         self._table.sync(devices)
-        self._clock_tab.sync(devices)
-        self._start_clock_refresh()
 
     def _on_discovered(self, devices: dict):
         self._table.load(devices)
-        self._clock_tab.load(devices)
-        self._start_clock_refresh()
         tx = sum(1 for d in devices.values() if d.tx_channels)
         rx = sum(1 for d in devices.values() if d.rx_channels)
         self._show_status(
             f"{len(devices)} device(s)  —  {tx} transmitter(s), {rx} receiver(s)"
         )
         self._btn_refresh.setEnabled(True)
-
-    def _start_clock_refresh(self):
-        """Kick off a background fetch of get_clocking_status() for all devices.
-
-        discover_and_populate() does not fetch clock data — it must be
-        requested separately per device.  This worker calls
-        get_clocking_status() on every known device then feeds the result
-        back to the clock tab so preferred_leader / clock_role are populated.
-        """
-        if self._clock_worker is not None and self._clock_worker.isRunning():
-            print("[clock-refresh] skipped — worker already running")
-            return
-        print("[clock-refresh] launching ClockRefreshWorker")
-        w = ClockRefreshWorker(self._clock_tab.devices)
-        w.done.connect(self._clock_tab.sync)
-        self._clock_worker = w
-        self._all_workers.append(w)
-        w.start()
 
     def _on_error(self, msg: str):
         self._show_status(f"Discovery failed: {msg}")
