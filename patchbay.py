@@ -30,6 +30,8 @@ from netaudio.dante.services.notification import (
 )
 from netaudio.common.app_config import settings as netaudio_settings
 
+netaudio_settings.mdns_timeout = 3
+
 log = logging.getLogger("patchbay")
 
 # Notification IDs that signal a routing/subscription change on a device.
@@ -237,8 +239,9 @@ class DiscoveryWorker(QThread):
     device on the network).  Use this for the manual Refresh button and the
     periodic deep-sync timer.
     """
-    done   = pyqtSignal(dict)
-    failed = pyqtSignal(str)
+    done           = pyqtSignal(dict)
+    failed         = pyqtSignal(str)
+    partial_update = pyqtSignal(dict)   # new devices found before ARC data arrives
 
     def __init__(self, force_full: bool = False):
         super().__init__()
@@ -252,15 +255,32 @@ class DiscoveryWorker(QThread):
             self.failed.emit(str(exc))
 
     async def _discover(self):
+        import time as _time
+        _t0 = _time.monotonic()
+        def _elapsed(): return _time.monotonic() - _t0
+        print(f"[timing] _discover start  force_full={self._force_full}")
+
         app = _engine.app
         devices = None if self._force_full else await get_devices_from_daemon()
         source = "daemon-cache"
         if devices is None:
             source = "ARC full-query"
-            devices = await app.discover_and_populate(
-                timeout=netaudio_settings.mdns_timeout
+            print(f"[timing] {_elapsed():.2f}s  launching discover_and_populate  timeout={netaudio_settings.mdns_timeout}s")
+            task = asyncio.create_task(
+                app.discover_and_populate(timeout=netaudio_settings.mdns_timeout)
             )
+            last_snapshot: set = set()
+            while not task.done():
+                await asyncio.sleep(0.5)
+                current_sns = set(app.devices.keys())
+                if current_sns != last_snapshot and current_sns:
+                    last_snapshot = current_sns
+                    print(f"[timing] {_elapsed():.2f}s  partial_update: {len(current_sns)} device(s) in app.devices")
+                    self.partial_update.emit(dict(app.devices))
+            print(f"[timing] {_elapsed():.2f}s  discover_and_populate done  devices={len(app.devices)}")
+            devices = task.result()
         else:
+            print(f"[timing] {_elapsed():.2f}s  daemon cache hit  devices={len(devices)}")
             # Register daemon devices in app.devices so _device_by_ip can
             # find them when routing notifications arrive.  We intentionally
             # do NOT call populate_controls here: doing so on every 5-second
@@ -288,6 +308,7 @@ class DiscoveryWorker(QThread):
             devices = app.devices
 
         devices = devices or {}
+        print(f"[timing] {_elapsed():.2f}s  _discover returning  source={source}  devices={len(devices)}")
         log.debug("[discover] source=%s  devices=%d", source, len(devices))
         for sn, d in devices.items():
             tx_chs = list(d.tx_channels.keys()) if d.tx_channels else []
@@ -1721,9 +1742,13 @@ class PatchBayWindow(QMainWindow):
 
     def refresh(self):
         """Manual refresh: full ARC re-query of all devices, then rebuilds the grid."""
+        import time as _time
+        self._refresh_t0 = _time.monotonic()
+        print(f"[timing] {self._refresh_t0:.3f}  refresh() called")
         self._btn_refresh.setEnabled(False)
         self._show_status("Discovering devices…")
         w = DiscoveryWorker(force_full=True)
+        w.partial_update.connect(self._on_partial_update)
         w.done.connect(self._on_discovered)
         w.failed.connect(self._on_error)
         self._discovery_worker = w
@@ -1743,10 +1768,18 @@ class PatchBayWindow(QMainWindow):
         if self._bg_worker is not None and self._bg_worker.isRunning():
             return
         w = DiscoveryWorker()
+        w.partial_update.connect(self._on_partial_update)
         w.done.connect(self._on_bg_refresh)
         self._bg_worker = w
         self._all_workers.append(w)
         w.start()
+
+    def _on_partial_update(self, devices: dict):
+        """Mid-discovery: devices found but ARC channel data not yet populated."""
+        import time as _time
+        print(f"[timing] {_time.monotonic():.3f}  _on_partial_update  devices={len(devices)}")
+        self._clock_tab.sync(devices)
+        self._show_status(f"Found {len(devices)} device(s)…")
 
     def _on_bg_refresh(self, devices: dict):
         self._table.sync(devices)
@@ -1754,6 +1787,10 @@ class PatchBayWindow(QMainWindow):
         self._start_clock_refresh()
 
     def _on_discovered(self, devices: dict):
+        import time as _time
+        _now = _time.monotonic()
+        _elapsed = f"  (+{_now - self._refresh_t0:.2f}s from refresh)" if hasattr(self, '_refresh_t0') else ""
+        print(f"[timing] {_now:.3f}  _on_discovered  devices={len(devices)}{_elapsed}")
         self._table.load(devices)
         self._clock_tab.load(devices)
         self._start_clock_refresh()
