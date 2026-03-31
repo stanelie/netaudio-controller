@@ -8,7 +8,8 @@ import logging
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QCheckBox, QStatusBar, QAbstractItemView, QStyledItemDelegate,
+    QPushButton, QCheckBox, QLabel, QLineEdit, QStatusBar,
+    QAbstractItemView, QStyledItemDelegate,
     QTableWidget, QTableWidgetItem, QTabWidget,
 )
 from PyQt6.QtCore import Qt, QRect, QThread, pyqtSignal, QSize, QTimer
@@ -47,6 +48,7 @@ C_RX_HDR    = QColor(90,  40, 110)   # RX device header (dark purple)
 C_TX_CH     = QColor(205, 220, 245)  # TX channel label
 C_RX_CH     = QColor(230, 210, 242)  # RX channel label
 C_HDR_FG    = QColor(255, 255, 255)  # white text on coloured headers
+C_CH_FG     = QColor(25,  25,  25)   # near-black text on channel label cells
 C_CONN      = QColor(50,  175,  70)  # connected dot (green)
 C_ERROR     = QColor(200,  50,  50)  # error dot (red — connected but faulted)
 C_EMPTY_DOT = QColor(195, 195, 195)  # disconnected dot (grey)
@@ -425,6 +427,42 @@ class ClockSetLeaderWorker(QThread):
             )
 
 
+# ── Channel rename worker ─────────────────────────────────────────────────────
+class ChannelRenameWorker(QThread):
+    """Sends a set- or reset-channel-name command to a device."""
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, device, channel_type: str, channel_number: int, new_name: str):
+        super().__init__()
+        self._device         = device
+        self._channel_type   = channel_type
+        self._channel_number = channel_number
+        self._new_name       = new_name
+
+    def run(self):
+        future = _engine.submit(self._rename())
+        try:
+            future.result(timeout=10)
+            self.done.emit(True, "")
+        except Exception as exc:
+            self.done.emit(False, str(exc))
+
+    async def _rename(self):
+        cmds = DanteDeviceCommands()
+        ip   = str(self._device.ipv4)
+        port = _arc_port(self._device)
+        if self._new_name:
+            packet, _ = cmds.command_set_channel_name(
+                self._channel_type, self._channel_number, self._new_name)
+        else:
+            packet, _ = cmds.command_reset_channel_name(
+                self._channel_type, self._channel_number)
+        result = await device_request_via_daemon(packet, ip, port)
+        if result is None:
+            await _engine.app.arc.request(
+                packet, ip, port, logical_command_name="rename_channel")
+
+
 # ── Clock status fetch worker ─────────────────────────────────────────────────
 class ClockRefreshWorker(QThread):
     """Calls get_clocking_status() on every device to populate clock fields.
@@ -502,6 +540,7 @@ class PatchBayTable(QTableWidget):
         self.setShowGrid(True)
         self.setGridStyle(Qt.PenStyle.SolidLine)
         self.cellClicked.connect(self._cell_clicked)
+        self.cellDoubleClicked.connect(self._cell_double_clicked)
 
     # ── Public ─────────────────────────────────────────────────────────────────
     def load(self, devices: dict):
@@ -613,10 +652,10 @@ class PatchBayTable(QTableWidget):
                 ch  = entry['channel']
                 lbl = ch.friendly_name or ch.name
                 it = self._make_item(
-                    lbl, bg=C_TX_CH, font=_small_font(),
-                    flags=Qt.ItemFlag.NoItemFlags,
+                    lbl, bg=C_TX_CH, fg=C_CH_FG, font=_small_font(),
+                    flags=Qt.ItemFlag.ItemIsEnabled,
                 )
-                it.setToolTip(f"{entry['dname']}  /  {lbl}")
+                it.setToolTip(f"{entry['dname']}  /  {lbl}  (double-click to rename)")
             self.setItem(0, col, it)
 
     def _fill_rx_headers(self):
@@ -637,10 +676,10 @@ class PatchBayTable(QTableWidget):
                 ch  = entry['channel']
                 lbl = ch.friendly_name or ch.name
                 it = self._make_item(
-                    f"  {lbl}", bg=C_RX_CH, font=_small_font(),
-                    align=left, flags=Qt.ItemFlag.NoItemFlags,
+                    f"  {lbl}", bg=C_RX_CH, fg=C_CH_FG, font=_small_font(),
+                    align=left, flags=Qt.ItemFlag.ItemIsEnabled,
                 )
-                it.setToolTip(f"{entry['dname']}  /  {lbl}")
+                it.setToolTip(f"{entry['dname']}  /  {lbl}  (double-click to rename)")
                 it.setData(Qt.ItemDataRole.UserRole, {
                     'kind': 'rx_ch',
                     'status': self._get_rx_status(entry['dname'], ch.name),
@@ -927,6 +966,84 @@ class PatchBayTable(QTableWidget):
 
         elif kind == 'conn' and not data.get('pending'):
             self._toggle_connection(row, col, data)
+
+    def _cell_double_clicked(self, row: int, col: int):
+        """Open an inline editor when the user double-clicks a channel name cell."""
+        if row == 0 and 1 <= col <= len(self._tx_struct):
+            entry = self._tx_struct[col - 1]
+            if entry['kind'] == 'chan':
+                self._start_inline_edit(row, col, entry['device'], entry['channel'])
+        elif col == 0 and 1 <= row <= len(self._rx_struct):
+            entry = self._rx_struct[row - 1]
+            if entry['kind'] == 'chan':
+                self._start_inline_edit(row, col, entry['device'], entry['channel'])
+
+    def _start_inline_edit(self, row: int, col: int, device, channel):
+        current = channel.friendly_name or channel.name or ""
+
+        table = self   # capture for closures
+
+        class _Editor(QLineEdit):
+            def keyPressEvent(self_, event):
+                if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    _commit()
+                elif event.key() == Qt.Key.Key_Escape:
+                    _cancel()
+                else:
+                    super().keyPressEvent(event)
+            def focusOutEvent(self_, event):
+                _commit()
+                super().focusOutEvent(event)
+
+        _done = [False]
+
+        def _commit():
+            if _done[0]:
+                return
+            _done[0] = True
+            new_name = editor.text().strip()
+            table.setCellWidget(row, col, None)
+            if new_name != current:
+                table._apply_rename(row, col, device, channel, new_name)
+
+        def _cancel():
+            if _done[0]:
+                return
+            _done[0] = True
+            table.setCellWidget(row, col, None)
+
+        editor = _Editor(current)
+        editor.setMaxLength(31)
+        editor.selectAll()
+        editor.setStyleSheet(
+            "background: white; color: #191919; border: 2px solid #2860A0; padding: 1px;")
+        self.setCellWidget(row, col, editor)
+        editor.setFocus()
+
+    def _apply_rename(self, row: int, col: int, device, channel, new_name: str):
+        if len(new_name) > 31:
+            self.status.emit("Channel name too long (max 31 characters)")
+            return
+
+        # Update local display immediately for responsiveness
+        channel.friendly_name = new_name or None
+        lbl = channel.friendly_name or channel.name or ""
+        item = self.item(row, col)
+        if item:
+            item.setText(f"  {lbl}" if col == 0 else lbl)
+            item.setToolTip(f"{device.name}  /  {lbl}")
+
+        w = ChannelRenameWorker(device, channel.channel_type, channel.number, new_name)
+        w.done.connect(lambda ok, msg, n=new_name: self._on_rename_done(ok, msg, n))
+        self._workers.append(w)
+        w.start()
+
+    def _on_rename_done(self, ok: bool, msg: str, new_name: str):
+        if ok:
+            label = f"'{new_name}'" if new_name else "default"
+            self.status.emit(f"Channel renamed to {label}")
+        else:
+            self.status.emit(f"Channel rename failed: {msg}")
 
     def _clear_row_connections(self, row: int, except_col: int, rx_dev, rx_ch):
         """Optimistically uncheck any other TX already connected to this RX channel."""
@@ -1221,7 +1338,6 @@ class ClockStatusTab(QWidget):
         hbox.setContentsMargins(0, 0, 0, 0)
 
         if pm is None:
-            from PyQt6.QtWidgets import QLabel
             lbl = QLabel("Follower only")
             lbl.setStyleSheet(f"color: rgb({C_CLOCK_FG.red()},{C_CLOCK_FG.green()},{C_CLOCK_FG.blue()});")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1590,17 +1706,40 @@ class PatchBayWindow(QMainWindow):
         #    processes these CONMON packets (opcode 0x0020) via
         #    _handle_ptp_clock_status, which updates device.preferred_leader and
         #    device.ptp_v1_role directly but never dispatches a NOTIFICATION_RECEIVED
-        #    event.  Hook _notify_preferred_leader_waiter — called at the very end of
-        #    _handle_ptp_clock_status — to get an immediate signal on every broadcast
-        #    or probe response without any extra polling or network traffic.
+        #    event.  We wrap _handle_ptp_clock_status to also extract the presence
+        #    bitmask (4 bytes before preferred_leader at offset 0x22), setting
+        #    device.preferred_leader_configurable = bool(bitmask & 0x0002).
+        #    We also hook _notify_preferred_leader_waiter (called at the very end)
+        #    to trigger a UI repaint without any extra polling or network traffic.
         _clock_signal = self._clock_status_received
-        _original_notify = app.notifications._notify_preferred_leader_waiter
+        _notifications = app.notifications
+        _original_handle = _notifications._handle_ptp_clock_status
+        _original_notify = _notifications._notify_preferred_leader_waiter
+
+        _PRESENCE_OFFSET = 0x22  # 4 bytes before CONMON_PREFERRED_LEADER_OFFSET (0x26)
+        _PRESENCE_LEN    = 4
+        _CONFIGURABLE_BIT = 0x0002
+
+        def _hooked_handle(data: bytes, source_ip: str):
+            # Extract presence bitmask before the original handler runs
+            configurable = None
+            if len(data) >= _PRESENCE_OFFSET + _PRESENCE_LEN:
+                import struct as _struct
+                bitmask = _struct.unpack(">I", data[_PRESENCE_OFFSET:_PRESENCE_OFFSET + _PRESENCE_LEN])[0]
+                configurable = bool(bitmask & _CONFIGURABLE_BIT)
+            _original_handle(data, source_ip)
+            # After original handler the device object is updated — set our attribute
+            device = _notifications._lookup_device(source_ip)
+            if device is not None and configurable is not None:
+                device.preferred_leader_configurable = configurable
+
+        _notifications._handle_ptp_clock_status = _hooked_handle
 
         def _hooked_notify(source_ip: str, preferred_leader):
             _original_notify(source_ip, preferred_leader)
             _clock_signal.emit(source_ip)
 
-        app.notifications._notify_preferred_leader_waiter = _hooked_notify
+        _notifications._notify_preferred_leader_waiter = _hooked_notify
 
     def _on_clock_status_received(self, source_ip: str):
         """Called immediately (Qt main thread) when any device sends a PTP clock
