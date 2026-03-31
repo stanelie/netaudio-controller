@@ -697,8 +697,7 @@ class PatchBayTable(QTableWidget):
         if conn_data is None:
             return None
         rx_ch_status = conn_data[3] or 0
-        error = bool(rx_ch_status) and not (rx_ch_status & 0x0001)
-        return 'error' if error else 'ok'
+        return 'ok' if (rx_ch_status & 0x0001) else 'error'
 
     def _update_rx_header_status(self) -> bool:
         """Refresh the status dot stored in every RX channel header cell (col 0).
