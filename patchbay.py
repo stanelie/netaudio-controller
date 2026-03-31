@@ -1277,29 +1277,10 @@ class ClockStatusTab(QWidget):
         self._table.setColumnWidth(self.COL_LEADER, 130)
 
     def _fill_row(self, row: int, sn: str, device):
-        dev_name = device.name or sn
-        ip_str   = str(device.ipv4) if getattr(device, 'ipv4', None) else "—"
-        pm       = getattr(device, 'preferred_leader', None)
-
-        # ── DEBUG ──────────────────────────────────────────────────────────────
-        # Dump every attribute of the device object so we can find the real
-        # clock-related field names regardless of library version.
-        clock_attrs = {
-            k: getattr(device, k)
-            for k in dir(device)
-            if not k.startswith('_') and any(
-                kw in k.lower()
-                for kw in ('clock', 'master', 'leader', 'preferred', 'ptp',
-                           'sync', 'primary', 'domain', 'grandmaster')
-            )
-        }
-        print(f"[clock-debug] device={dev_name!r}  preferred_leader={pm!r}")
-        if clock_attrs:
-            for k, v in sorted(clock_attrs.items()):
-                print(f"  {k} = {v!r}")
-        else:
-            print(f"  (no clock-related attributes found)")
-        # ── END DEBUG ──────────────────────────────────────────────────────────
+        dev_name     = device.name or sn
+        ip_str       = str(device.ipv4) if getattr(device, 'ipv4', None) else "—"
+        pm           = getattr(device, 'preferred_leader', None)
+        configurable = getattr(device, 'preferred_leader_configurable', None)
 
         # Col 0: device name — stores sn in UserRole for later lookups
         it = QTableWidgetItem(dev_name)
@@ -1315,7 +1296,7 @@ class ClockStatusTab(QWidget):
         self._table.setItem(row, self.COL_IP, it)
 
         # Col 2: Preferred Leader checkbox (widget-in-cell, centred)
-        self._set_leader_checkbox(row, sn, pm)
+        self._set_leader_checkbox(row, sn, pm, configurable)
 
         # Col 3: Clock role
         it = QTableWidgetItem(self._clock_role(device))
@@ -1326,18 +1307,19 @@ class ClockStatusTab(QWidget):
 
         self._apply_row_colour(row, sn)
 
-    def _set_leader_checkbox(self, row: int, sn: str, pm):
+    def _set_leader_checkbox(self, row: int, sn: str, pm, configurable=None):
         """Create (or recreate) the Preferred Leader cell widget.
 
-        When pm is None the device does not support preferred-leader selection;
-        show a static 'Follower only' label instead of a checkbox.
+        Shows 'Follower only' when pm is None (probe not yet returned) or when
+        configurable is explicitly False (PTP priority1=0xFF, device is hardcoded
+        as follower-only, e.g. BLN).  Shows a checkbox otherwise.
         """
         container = QWidget()
         hbox = QHBoxLayout(container)
         hbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hbox.setContentsMargins(0, 0, 0, 0)
 
-        if pm is None:
+        if pm is None or configurable is False:
             lbl = QLabel("Follower only")
             lbl.setStyleSheet(f"color: rgb({C_CLOCK_FG.red()},{C_CLOCK_FG.green()},{C_CLOCK_FG.blue()});")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1369,33 +1351,18 @@ class ClockStatusTab(QWidget):
 
             # Update checkbox only when not waiting for confirmation
             if sn not in self._pending:
-                pm        = getattr(device, 'preferred_leader', None)
+                pm           = getattr(device, 'preferred_leader', None)
+                configurable = getattr(device, 'preferred_leader_configurable', None)
 
-                # ── DEBUG ──────────────────────────────────────────────────────
-                clock_attrs = {
-                    k: getattr(device, k)
-                    for k in dir(device)
-                    if not k.startswith('_') and any(
-                        kw in k.lower()
-                        for kw in ('clock', 'master', 'leader', 'preferred',
-                                   'ptp', 'sync', 'primary', 'domain', 'grandmaster')
-                    )
-                }
-                print(f"[clock-sync] device={device.name or sn!r}  preferred_leader={pm!r}  "
-                      f"pending={sn in self._pending}")
-                for k, v in sorted(clock_attrs.items()):
-                    print(f"  {k} = {v!r}")
-                # ── END DEBUG ──────────────────────────────────────────────────
-
+                should_show_label = pm is None or configurable is False
                 container = self._table.cellWidget(row, self.COL_LEADER)
                 has_checkbox = container is not None and container.findChild(QCheckBox) is not None
-                if pm is None and has_checkbox:
-                    # Device no longer reports preferred-leader — switch to label
-                    self._set_leader_checkbox(row, sn, pm)
-                elif pm is not None and not has_checkbox:
-                    # Device now reports preferred-leader — switch to checkbox
-                    self._set_leader_checkbox(row, sn, pm)
-                elif pm is not None and has_checkbox:
+
+                if should_show_label and has_checkbox:
+                    self._set_leader_checkbox(row, sn, pm, configurable)
+                elif not should_show_label and not has_checkbox:
+                    self._set_leader_checkbox(row, sn, pm, configurable)
+                elif not should_show_label and has_checkbox:
                     chk = container.findChild(QCheckBox)
                     chk.blockSignals(True)
                     chk.setChecked(bool(pm))
@@ -1706,32 +1673,24 @@ class PatchBayWindow(QMainWindow):
         #    processes these CONMON packets (opcode 0x0020) via
         #    _handle_ptp_clock_status, which updates device.preferred_leader and
         #    device.ptp_v1_role directly but never dispatches a NOTIFICATION_RECEIVED
-        #    event.  We wrap _handle_ptp_clock_status to also extract the presence
-        #    bitmask (4 bytes before preferred_leader at offset 0x22), setting
-        #    device.preferred_leader_configurable = bool(bitmask & 0x0002).
-        #    We also hook _notify_preferred_leader_waiter (called at the very end)
-        #    to trigger a UI repaint without any extra polling or network traffic.
+        #    event.  Hook _notify_preferred_leader_waiter — called at the very end of
+        #    _handle_ptp_clock_status — to get an immediate signal on every broadcast
+        #    or probe response without any extra polling or network traffic.
         _clock_signal = self._clock_status_received
         _notifications = app.notifications
         _original_handle = _notifications._handle_ptp_clock_status
         _original_notify = _notifications._notify_preferred_leader_waiter
 
-        _PRESENCE_OFFSET = 0x22  # 4 bytes before CONMON_PREFERRED_LEADER_OFFSET (0x26)
-        _PRESENCE_LEN    = 4
-        _CONFIGURABLE_BIT = 0x0002
-
         def _hooked_handle(data: bytes, source_ip: str):
-            # Extract presence bitmask before the original handler runs
-            configurable = None
-            if len(data) >= _PRESENCE_OFFSET + _PRESENCE_LEN:
-                import struct as _struct
-                bitmask = _struct.unpack(">I", data[_PRESENCE_OFFSET:_PRESENCE_OFFSET + _PRESENCE_LEN])[0]
-                configurable = bool(bitmask & _CONFIGURABLE_BIT)
             _original_handle(data, source_ip)
-            # After original handler the device object is updated — set our attribute
+            # Byte at offset 0x27 (index 39) is the PTP priority1 value.
+            # Follower-only devices (e.g. BLN) are hardcoded at 0xFF (= 255,
+            # the absolute minimum — they can never win clock election).
+            # Configurable devices report lower values (0x9d, 0x9f, etc.).
             device = _notifications._lookup_device(source_ip)
-            if device is not None and configurable is not None:
-                device.preferred_leader_configurable = configurable
+            if device is not None and len(data) > 0x27:
+                priority1 = data[0x27]
+                device.preferred_leader_configurable = (priority1 != 0xFF)
 
         _notifications._handle_ptp_clock_status = _hooked_handle
 
