@@ -1363,15 +1363,14 @@ class ClockStatusTab(QWidget):
     COL_NAME      = 0
     COL_IP        = 1
     COL_LEADER    = 2
-    COL_V1        = 3
-    COL_IF_MODE   = 4
-    COL_IF_IP     = 5
-    COL_IF_MASK   = 6
-    COL_IF_GW     = 7
-    COL_IF_DNS    = 8
-    COL_APPLY     = 9
-    COL_REBOOT    = 10
-    _HEADERS      = ["Device", "IP Address", "Preferred Leader", "Primary V1",
+    COL_IF_MODE   = 3
+    COL_IF_IP     = 4
+    COL_IF_MASK   = 5
+    COL_IF_GW     = 6
+    COL_IF_DNS    = 7
+    COL_APPLY     = 8
+    COL_REBOOT    = 9
+    _HEADERS      = ["Device", "IP Address", "Preferred Leader",
                      "Mode", "Interface IP", "Netmask", "Gateway", "DNS Server", "", ""]
 
     def __init__(self):
@@ -1469,7 +1468,7 @@ class ClockStatusTab(QWidget):
         for row, (sn, device) in enumerate(items):
             self._fill_row(row, sn, device)
         self._table.resizeColumnsToContents()
-        self._table.setColumnWidth(self.COL_LEADER, 130)
+        self._table.setColumnWidth(self.COL_LEADER, 170)
         self._table.setColumnWidth(self.COL_APPLY,  110)
         self._table.setColumnWidth(self.COL_REBOOT, 70)
 
@@ -1488,18 +1487,11 @@ class ClockStatusTab(QWidget):
         it.setForeground(QBrush(C_CLOCK_FG))
         self._table.setItem(row, self.COL_IP, it)
 
-        # Col 2: Preferred Leader checkbox (widget-in-cell, centred)
-        self._set_leader_checkbox(row, sn, pm, configurable)
+        # Col 2: Preferred Leader checkbox (widget-in-cell, centred) + V1 role label
+        v1_role = getattr(device, 'ptp_v1_role', None)
+        self._set_leader_checkbox(row, sn, pm, configurable, v1_role)
 
-        # Col 3: Primary V1 clock leader
-        v1_text = "leader" if getattr(device, 'ptp_v1_role', None) == "Leader" else "—"
-        it = QTableWidgetItem(v1_text)
-        it.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        it.setForeground(QBrush(C_CLOCK_FG))
-        self._table.setItem(row, self.COL_V1, it)
-
-        # Cols 4–9: network interface widgets (mode dropdown, editable fields, apply button)
+        # Cols 3–8: network interface widgets (mode dropdown, editable fields, apply button)
         self._fill_if_cells(row, sn, device)
 
         # Col 10: Reboot button
@@ -1507,22 +1499,24 @@ class ClockStatusTab(QWidget):
 
         self._apply_row_colour(row, sn)
 
-    def _set_leader_checkbox(self, row: int, sn: str, pm, configurable=None):
+    def _set_leader_checkbox(self, row: int, sn: str, pm, configurable=None, v1_role=None):
         """Create (or recreate) the Preferred Leader cell widget.
 
         Shows 'Follower only' when pm is None (probe not yet returned) or when
         configurable is explicitly False (PTP priority1=0xFF, device is hardcoded
         as follower-only, e.g. BLN).  Shows a checkbox otherwise.
+        The V1 clock role is displayed as a label to the right of the checkbox.
         """
         container = QWidget()
         hbox = QHBoxLayout(container)
-        hbox.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hbox.setContentsMargins(0, 0, 0, 0)
+        hbox.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        hbox.setContentsMargins(6, 0, 0, 0)
+        hbox.setSpacing(6)
 
         if pm is None or configurable is False:
             lbl = QLabel("Follower only")
             lbl.setStyleSheet(f"color: rgb({C_CLOCK_FG.red()},{C_CLOCK_FG.green()},{C_CLOCK_FG.blue()});")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
             hbox.addWidget(lbl)
         else:
             chk = QCheckBox()
@@ -1535,6 +1529,13 @@ class ClockStatusTab(QWidget):
             )
             chk.stateChanged.connect(lambda state, s=sn: self._on_leader_toggled(s, state))
             hbox.addWidget(chk)
+
+        if v1_role == "Leader":
+            v1_lbl = QLabel("leader")
+            v1_lbl.setObjectName("v1_lbl")
+            v1_lbl.setStyleSheet(f"color: rgb({C_CLOCK_FG.red()},{C_CLOCK_FG.green()},{C_CLOCK_FG.blue()});")
+            v1_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+            hbox.addWidget(v1_lbl)
 
         self._table.setCellWidget(row, self.COL_LEADER, container)
 
@@ -1905,15 +1906,16 @@ class ClockStatusTab(QWidget):
             if sn not in self._pending:
                 pm           = getattr(device, 'preferred_leader', None)
                 configurable = getattr(device, 'preferred_leader_configurable', None)
+                v1_role      = getattr(device, 'ptp_v1_role', None)
 
                 should_show_label = pm is None or configurable is False
                 container = self._table.cellWidget(row, self.COL_LEADER)
                 has_checkbox = container is not None and container.findChild(QCheckBox) is not None
 
                 if should_show_label and has_checkbox:
-                    self._set_leader_checkbox(row, sn, pm, configurable)
+                    self._set_leader_checkbox(row, sn, pm, configurable, v1_role)
                 elif not should_show_label and not has_checkbox:
-                    self._set_leader_checkbox(row, sn, pm, configurable)
+                    self._set_leader_checkbox(row, sn, pm, configurable, v1_role)
                 elif not should_show_label and has_checkbox:
                     chk = container.findChild(QCheckBox)
                     chk.blockSignals(True)
@@ -1926,11 +1928,22 @@ class ClockStatusTab(QWidget):
                 if not (isinstance(name_w, QLineEdit) and name_w.hasFocus()):
                     self._fill_name_cell(row, sn, device)
 
-            # Primary V1 text
-            v1_it = self._table.item(row, self.COL_V1)
-            if v1_it:
-                cr = getattr(device, 'ptp_v1_role', None)
-                v1_it.setText("leader" if cr == "Leader" else "—")
+            # Primary V1 label (appears only when device is V1 leader)
+            cr = getattr(device, 'ptp_v1_role', None)
+            container = self._table.cellWidget(row, self.COL_LEADER)
+            if container:
+                v1_lbl = container.findChild(QLabel, "v1_lbl")
+                is_leader = cr == "Leader"
+                if is_leader and v1_lbl is None:
+                    # Label needs to appear — rebuild the cell
+                    pm           = getattr(device, 'preferred_leader', None)
+                    configurable = getattr(device, 'preferred_leader_configurable', None)
+                    self._set_leader_checkbox(row, sn, pm, configurable, cr)
+                elif not is_leader and v1_lbl is not None:
+                    # Label needs to disappear — rebuild the cell
+                    pm           = getattr(device, 'preferred_leader', None)
+                    configurable = getattr(device, 'preferred_leader_configurable', None)
+                    self._set_leader_checkbox(row, sn, pm, configurable, cr)
 
             # Interface columns — skip if the user is actively interacting with
             # this row (typing in a field or a combo dropdown is open) so we
@@ -1946,7 +1959,7 @@ class ClockStatusTab(QWidget):
             colour = flash or C_PENDING_ROW
         else:
             colour = None
-        for col in (self.COL_NAME, self.COL_IP, self.COL_V1,
+        for col in (self.COL_NAME, self.COL_IP,
                     self.COL_IF_IP, self.COL_IF_MASK, self.COL_IF_GW, self.COL_IF_DNS):
             it = self._table.item(row, col)
             if it:
