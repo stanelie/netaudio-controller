@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QCheckBox, QLabel, QLineEdit, QStatusBar,
     QAbstractItemView, QStyledItemDelegate,
     QTableWidget, QTableWidgetItem, QTabWidget,
+    QComboBox, QMessageBox,
 )
 from PyQt6.QtCore import Qt, QRect, QThread, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QColor, QFont, QBrush, QPainter, QPen
@@ -519,6 +520,82 @@ class ClockRefreshWorker(QThread):
         # Probe all devices concurrently so total time ≈ one round-trip, not N×timeout.
         await asyncio.gather(*(_probe_one(sn, ip) for sn, ip in ips))
         return self._devices
+
+
+# ── Interface config worker ────────────────────────────────────────────────────
+class InterfaceConfigWorker(QThread):
+    """Sends a DHCP or static IP config command to a device's network interface."""
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, device, mode: str, ip: str = "", mask: str = "",
+                 gw: str = "", dns: str = ""):
+        super().__init__()
+        self._device = device
+        self._mode   = mode
+        self._ip     = ip
+        self._mask   = mask
+        self._gw     = gw
+        self._dns    = dns
+
+    def run(self):
+        future = _engine.submit(self._send())
+        try:
+            future.result(timeout=10)
+            self.done.emit(True, "")
+        except Exception as exc:
+            self.done.emit(False, str(exc))
+
+    async def _send(self):
+        cmds = DanteDeviceCommands()
+        ip   = str(self._device.ipv4)
+        if self._mode == "dynamic":
+            packet, _, port = cmds.command_set_interface_dhcp()
+        else:
+            # command_set_interface_static signature: (ip, netmask, dns_server, gateway)
+            # Substitute "0.0.0.0" for any omitted optional fields (gateway, DNS) —
+            # inet_aton rejects empty strings and the real Dante Controller allows
+            # leaving these blank when only IP/mask are required.
+            _or_zero = lambda v: v if v else "0.0.0.0"
+            packet, _, port = cmds.command_set_interface_static(
+                self._ip, self._mask, _or_zero(self._dns), _or_zero(self._gw)
+            )
+        result = await device_request_via_daemon(packet, ip, port)
+        if result is None:
+            await _engine.app.settings.request(
+                packet, ip, port, logical_command_name="interface_config"
+            )
+
+
+# ── Reboot worker ──────────────────────────────────────────────────────────────
+class RebootWorker(QThread):
+    """Sends a reboot command to a device."""
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, device):
+        super().__init__()
+        self._device = device
+
+    def run(self):
+        future = _engine.submit(self._send())
+        try:
+            future.result(timeout=10)
+            self.done.emit(True, "")
+        except Exception as exc:
+            self.done.emit(False, str(exc))
+
+    async def _send(self):
+        from netaudio.dante.services.cmc import _get_host_mac
+        cmds       = DanteDeviceCommands()
+        device_ip  = str(self._device.ipv4)
+        host_mac   = _get_host_mac()
+        packet, _, port = cmds.command_reboot(host_mac=host_mac)
+        # Reboot is fire-and-forget — the device drops off the network immediately
+        # and never sends a response.  Mirror device_operations.reboot(): send 3
+        # times with short delays so at least one packet gets through.
+        for attempt in range(3):
+            _engine.app.settings.send(packet, device_ip, port)
+            if attempt < 2:
+                await asyncio.sleep(0.1)
 
 
 # ── Patch bay table ────────────────────────────────────────────────────────────
@@ -1213,11 +1290,19 @@ class ClockStatusTab(QWidget):
     _VERIFY_DELAY_MS = 4_000   # ms between re-query attempts
     _CHANGE_TTL      = 15      # s  — give up and revert after this long
 
-    COL_NAME   = 0
-    COL_IP     = 1
-    COL_LEADER = 2
-    COL_V1     = 3
-    _HEADERS   = ["Device", "IP Address", "Preferred Leader", "Primary V1"]
+    COL_NAME      = 0
+    COL_IP        = 1
+    COL_LEADER    = 2
+    COL_V1        = 3
+    COL_IF_MODE   = 4
+    COL_IF_IP     = 5
+    COL_IF_MASK   = 6
+    COL_IF_GW     = 7
+    COL_IF_DNS    = 8
+    COL_APPLY     = 9
+    COL_REBOOT    = 10
+    _HEADERS      = ["Device", "IP Address", "Preferred Leader", "Primary V1",
+                     "Mode", "Interface IP", "Netmask", "Gateway", "DNS Server", "", ""]
 
     def __init__(self):
         super().__init__()
@@ -1240,6 +1325,12 @@ class ClockStatusTab(QWidget):
         self._pending: dict = {}
         self._workers: list = []
         self._verify_timers: dict[str, QTimer] = {}
+        # sn → {mode, ip, mask, gw, dns} for uncommitted interface changes
+        self._if_pending: dict[str, dict] = {}
+        self._if_workers: list = []
+        # SNs whose interface config was applied but device not yet rebooted
+        self._if_reboot_pending: set[str] = set()
+        self._reboot_workers: list = []
 
     # ── Public interface (called by PatchBayWindow) ────────────────────────────
 
@@ -1295,6 +1386,8 @@ class ClockStatusTab(QWidget):
             self._fill_row(row, sn, device)
         self._table.resizeColumnsToContents()
         self._table.setColumnWidth(self.COL_LEADER, 130)
+        self._table.setColumnWidth(self.COL_APPLY,  110)
+        self._table.setColumnWidth(self.COL_REBOOT, 70)
 
     def _fill_row(self, row: int, sn: str, device):
         dev_name     = device.name or sn
@@ -1325,6 +1418,12 @@ class ClockStatusTab(QWidget):
         it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         it.setForeground(QBrush(C_CLOCK_FG))
         self._table.setItem(row, self.COL_V1, it)
+
+        # Cols 4–9: network interface widgets (mode dropdown, editable fields, apply button)
+        self._fill_if_cells(row, sn, device)
+
+        # Col 10: Reboot button
+        self._fill_reboot_cell(row, sn, device)
 
         self._apply_row_colour(row, sn)
 
@@ -1358,6 +1457,235 @@ class ClockStatusTab(QWidget):
             hbox.addWidget(chk)
 
         self._table.setCellWidget(row, self.COL_LEADER, container)
+
+    # ── Interface config helpers ───────────────────────────────────────────────
+
+    @staticmethod
+    def _if_corrected(iface: dict, key: str) -> str:
+        """Return the corrected value for *key* from a single interface dict.
+
+        NOTE: Workaround for a bug in netaudio's notification.py — for "dynamic"
+        (DHCP) mode the gateway and dns_server byte offsets are parsed in the
+        wrong order, so we swap them back here.  For "static" mode the library
+        parses them correctly.  When the upstream bug is fixed, remove this
+        method and call iface.get(key, "") directly everywhere it is used.
+        """
+        _DYNAMIC_SWAP = {"gateway": "dns_server", "dns_server": "gateway"}
+        k = _DYNAMIC_SWAP.get(key, key) if iface.get("mode") == "dynamic" else key
+        return iface.get(k, "")
+
+    def _fill_if_cells(self, row: int, sn: str, device):
+        """Populate cols COL_IF_MODE … COL_APPLY for one row.
+
+        If *sn* is in ``_if_pending`` the row is in an uncommitted-edit state:
+          - the mode combo reflects the desired (pending) mode
+          - for "static" pending: IP/mask/gw/dns shown as editable QLineEdits
+          - for "dynamic" pending: fields shown as greyed read-only text
+          - the Apply button is shown
+
+        Otherwise the widgets mirror the live device.interfaces[0] state.
+        """
+        ifaces   = getattr(device, 'interfaces', None) or []
+        iface0   = ifaces[0] if ifaces else {}
+        live_mode = iface0.get("mode", "")
+
+        pending = self._if_pending.get(sn)
+        if pending:
+            display_mode = pending["mode"]
+            display_ip   = pending["ip"]
+            display_mask = pending["mask"]
+            display_gw   = pending["gw"]
+            display_dns  = pending["dns"]
+            editable     = (display_mode == "static")
+        else:
+            display_mode = live_mode
+            display_ip   = self._if_corrected(iface0, "ip_address")
+            display_mask = self._if_corrected(iface0, "netmask")
+            display_gw   = self._if_corrected(iface0, "gateway")
+            display_dns  = self._if_corrected(iface0, "dns_server")
+            editable     = False
+
+        # Mode combo — block signals while populating to avoid a spurious
+        # currentTextChanged emission before the handler is connected.
+        combo = QComboBox()
+        combo.blockSignals(True)
+        combo.addItems(["dynamic", "static"])
+        combo.setCurrentIndex(1 if display_mode == "static" else 0)
+        combo.blockSignals(False)
+        combo.currentTextChanged.connect(
+            lambda mode, s=sn: self._on_if_mode_changed(s, mode)
+        )
+        self._table.setCellWidget(row, self.COL_IF_MODE, combo)
+
+        # IP / Mask / Gateway / DNS cells
+        for col, val in (
+            (self.COL_IF_IP,   display_ip),
+            (self.COL_IF_MASK, display_mask),
+            (self.COL_IF_GW,   display_gw),
+            (self.COL_IF_DNS,  display_dns),
+        ):
+            if editable:
+                le = QLineEdit(val)
+                le.setFrame(False)
+                le.setStyleSheet("background: white; color: #191919;")
+                self._table.setCellWidget(row, col, le)
+            else:
+                self._table.setCellWidget(row, col, None)
+                it = QTableWidgetItem(val if val else "—")
+                it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                it.setForeground(QBrush(C_CLOCK_FG))
+                self._table.setItem(row, col, it)
+
+        # Apply / status cell — three states:
+        #   pending edit  → "Apply" button
+        #   reboot needed → "Pending reboot" label
+        #   idle          → empty
+        if pending:
+            self._table.setCellWidget(row, self.COL_APPLY, None)
+            btn = QPushButton("Apply")
+            btn.clicked.connect(lambda _, s=sn: self._on_if_apply(s))
+            self._table.setCellWidget(row, self.COL_APPLY, btn)
+        elif sn in self._if_reboot_pending:
+            self._table.setCellWidget(row, self.COL_APPLY, None)
+            it = QTableWidgetItem("Pending reboot")
+            it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            it.setForeground(QBrush(QColor(180, 100, 0)))   # amber
+            self._table.setItem(row, self.COL_APPLY, it)
+        else:
+            self._table.setCellWidget(row, self.COL_APPLY, None)
+            it = QTableWidgetItem("")
+            it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self._table.setItem(row, self.COL_APPLY, it)
+
+    def _row_for_sn(self, sn: str) -> int:
+        for row in range(self._table.rowCount()):
+            it = self._table.item(row, self.COL_NAME)
+            if it and it.data(Qt.ItemDataRole.UserRole) == sn:
+                return row
+        return -1
+
+    def _row_if_has_interaction(self, row: int) -> bool:
+        """Return True only when the user is actively editing a widget in this row.
+
+        Non-editable item cells (plain QTableWidgetItem text) never block: clicking
+        them gives focus to the table itself, not to any child widget, so none of
+        the checks below fire.  Only real editing activity blocks the refresh:
+          - QComboBox: blocked while the widget has focus (user is about to or has
+            opened the dropdown) or while the dropdown popup is visibly open.
+          - QLineEdit: blocked while the widget has focus (user is typing).
+        """
+        for col in range(self.COL_IF_MODE, self.COL_REBOOT):
+            w = self._table.cellWidget(row, col)
+            if w is None:
+                continue
+            if isinstance(w, QComboBox):
+                if w.hasFocus() or w.view().isVisible():
+                    return True
+            elif isinstance(w, QLineEdit):
+                if w.hasFocus():
+                    return True
+        return False
+
+    def _on_if_mode_changed(self, sn: str, new_mode: str):
+        device = self._devices.get(sn)
+        if device is None:
+            return
+        ifaces = getattr(device, 'interfaces', None) or []
+        iface0 = ifaces[0] if ifaces else {}
+        live_mode = iface0.get("mode", "")
+
+        if new_mode == live_mode:
+            # User reverted to the device's current mode — cancel the pending edit.
+            self._if_pending.pop(sn, None)
+        else:
+            # Record pending change pre-filled with the current live values.
+            self._if_pending[sn] = {
+                "mode": new_mode,
+                "ip":   self._if_corrected(iface0, "ip_address"),
+                "mask": self._if_corrected(iface0, "netmask"),
+                "gw":   self._if_corrected(iface0, "gateway"),
+                "dns":  self._if_corrected(iface0, "dns_server"),
+            }
+
+        row = self._row_for_sn(sn)
+        if row >= 0:
+            self._fill_if_cells(row, sn, device)
+            self._table.setColumnWidth(self.COL_APPLY, 70)
+
+    def _on_if_apply(self, sn: str):
+        device  = self._devices.get(sn)
+        pending = self._if_pending.get(sn)
+        if device is None or pending is None:
+            return
+
+        # Read any edits the user made directly in the QLineEdit cells.
+        row = self._row_for_sn(sn)
+        if row >= 0 and pending["mode"] == "static":
+            for col, key in (
+                (self.COL_IF_IP,   "ip"),
+                (self.COL_IF_MASK, "mask"),
+                (self.COL_IF_GW,   "gw"),
+                (self.COL_IF_DNS,  "dns"),
+            ):
+                w = self._table.cellWidget(row, col)
+                if isinstance(w, QLineEdit):
+                    pending[key] = w.text().strip()
+
+        w = InterfaceConfigWorker(
+            device, pending["mode"],
+            pending.get("ip", ""), pending.get("mask", ""),
+            pending.get("gw", ""),  pending.get("dns", ""),
+        )
+        w.done.connect(lambda ok, msg, s=sn: self._on_if_done(s, ok, msg))
+        self._if_workers.append(w)
+        w.start()
+
+    def _on_if_done(self, sn: str, ok: bool, msg: str):
+        if ok:
+            self._if_pending.pop(sn, None)
+            self._if_reboot_pending.add(sn)
+            row    = self._row_for_sn(sn)
+            device = self._devices.get(sn)
+            if row >= 0 and device is not None:
+                self._fill_if_cells(row, sn, device)
+                self._table.setColumnWidth(self.COL_APPLY, 110)
+        else:
+            QMessageBox.warning(
+                self,
+                "Interface Config Failed",
+                f"Failed to send interface configuration:\n{msg}"
+            )
+        self._if_workers = [w for w in self._if_workers if w.isRunning()]
+
+    def _fill_reboot_cell(self, row: int, sn: str, device):
+        """Populate COL_REBOOT with a Reboot button for all devices."""
+        btn = QPushButton("Reboot")
+        btn.clicked.connect(lambda _, s=sn: self._on_reboot_clicked(s))
+        self._table.setCellWidget(row, self.COL_REBOOT, btn)
+
+    def _on_reboot_clicked(self, sn: str):
+        device = self._devices.get(sn)
+        if device is None:
+            return
+        w = RebootWorker(device)
+        w.done.connect(lambda ok, msg, s=sn: self._on_reboot_done(s, ok, msg))
+        self._reboot_workers.append(w)
+        w.start()
+
+    def _on_reboot_done(self, sn: str, ok: bool, msg: str):
+        if ok:
+            self._if_reboot_pending.discard(sn)
+            row    = self._row_for_sn(sn)
+            device = self._devices.get(sn)
+            if row >= 0 and device is not None:
+                self._fill_if_cells(row, sn, device)
+        else:
+            QMessageBox.warning(
+                self,
+                "Reboot Failed",
+                f"Failed to send reboot command:\n{msg}"
+            )
+        self._reboot_workers = [w for w in self._reboot_workers if w.isRunning()]
 
     def _update_rows(self):
         """Repaint all rows from current ``_devices`` and ``_pending`` state."""
@@ -1395,6 +1723,12 @@ class ClockStatusTab(QWidget):
                 cr = getattr(device, 'ptp_v1_role', None)
                 v1_it.setText("leader" if cr == "Leader" else "—")
 
+            # Interface columns — skip if the user is actively interacting with
+            # this row (typing in a field or a combo dropdown is open) so we
+            # don't yank the widget away mid-edit.
+            if sn not in self._if_pending and not self._row_if_has_interaction(row):
+                self._fill_if_cells(row, sn, device)
+
             self._apply_row_colour(row, sn)
 
     def _apply_row_colour(self, row: int, sn: str):
@@ -1403,7 +1737,8 @@ class ClockStatusTab(QWidget):
             colour = flash or C_PENDING_ROW
         else:
             colour = None
-        for col in (self.COL_NAME, self.COL_IP, self.COL_V1):
+        for col in (self.COL_NAME, self.COL_IP, self.COL_V1,
+                    self.COL_IF_IP, self.COL_IF_MASK, self.COL_IF_GW, self.COL_IF_DNS):
             it = self._table.item(row, col)
             if it:
                 if colour:
@@ -1599,7 +1934,7 @@ class PatchBayWindow(QMainWindow):
         # Clock Status tab
         self._clock_tab = ClockStatusTab()
         self._clock_tab.status.connect(self._show_status)
-        self._tabs.addTab(self._clock_tab, "Clock Status")
+        self._tabs.addTab(self._clock_tab, "Config")
 
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
