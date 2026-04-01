@@ -1361,16 +1361,15 @@ class ClockStatusTab(QWidget):
     _CHANGE_TTL      = 15      # s  — give up and revert after this long
 
     COL_NAME      = 0
-    COL_IP        = 1
-    COL_LEADER    = 2
-    COL_IF_MODE   = 3
-    COL_IF_IP     = 4
-    COL_IF_MASK   = 5
-    COL_IF_GW     = 6
-    COL_IF_DNS    = 7
-    COL_APPLY     = 8
-    COL_REBOOT    = 9
-    _HEADERS      = ["Device", "IP Address", "Preferred Leader",
+    COL_LEADER    = 1
+    COL_IF_MODE   = 2
+    COL_IF_IP     = 3
+    COL_IF_MASK   = 4
+    COL_IF_GW     = 5
+    COL_IF_DNS    = 6
+    COL_APPLY     = 7
+    COL_REBOOT    = 8
+    _HEADERS      = ["Device", "Preferred Leader",
                      "Mode", "Interface IP", "Netmask", "Gateway", "DNS Server", "", ""]
 
     def __init__(self):
@@ -1474,20 +1473,13 @@ class ClockStatusTab(QWidget):
 
     def _fill_row(self, row: int, sn: str, device):
         dev_name     = device.name or sn
-        ip_str       = str(device.ipv4) if getattr(device, 'ipv4', None) else "—"
         pm           = getattr(device, 'preferred_leader', None)
         configurable = getattr(device, 'preferred_leader_configurable', None)
 
         # Col 0: editable device name
         self._fill_name_cell(row, sn, device)
 
-        # Col 1: IP address
-        it = QTableWidgetItem(ip_str)
-        it.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        it.setForeground(QBrush(C_CLOCK_FG))
-        self._table.setItem(row, self.COL_IP, it)
-
-        # Col 2: Preferred Leader checkbox (widget-in-cell, centred) + V1 role label
+        # Col 1: Preferred Leader checkbox (widget-in-cell, centred) + V1 role label
         v1_role = getattr(device, 'ptp_v1_role', None)
         self._set_leader_checkbox(row, sn, pm, configurable, v1_role)
 
@@ -1666,7 +1658,8 @@ class ClockStatusTab(QWidget):
             editable     = (display_mode == "static")
         else:
             display_mode = live_mode
-            display_ip   = self._if_corrected(iface0, "ip_address")
+            display_ip   = self._if_corrected(iface0, "ip_address") or (
+                str(device.ipv4) if getattr(device, 'ipv4', None) else "")
             display_mask = self._if_corrected(iface0, "netmask")
             display_gw   = self._if_corrected(iface0, "gateway")
             display_dns  = self._if_corrected(iface0, "dns_server")
@@ -1971,7 +1964,7 @@ class ClockStatusTab(QWidget):
             colour = flash or C_PENDING_ROW
         else:
             colour = None
-        for col in (self.COL_NAME, self.COL_IP,
+        for col in (self.COL_NAME,
                     self.COL_IF_IP, self.COL_IF_MASK, self.COL_IF_GW, self.COL_IF_DNS):
             it = self._table.item(row, col)
             if it:
