@@ -1672,6 +1672,12 @@ class ClockStatusTab(QWidget):
             display_dns  = self._if_corrected(iface0, "dns_server")
             editable     = False
 
+        # Network settings are only configurable for devices that have reported
+        # interface data via the conmon interface_status notification.  Software
+        # devices such as Dante DVS never send that notification, so their
+        # device.interfaces remains None and the controls stay disabled.
+        if_configurable = getattr(device, 'interfaces', None) is not None
+
         # Mode combo — reuse the existing QComboBox if it already shows the
         # right value; replacing it on every _update_rows call causes the cell
         # to flash (the old widget is destroyed, the new one painted late).
@@ -1688,6 +1694,12 @@ class ClockStatusTab(QWidget):
                 lambda mode, s=sn: self._on_if_mode_changed(s, mode)
             )
             self._table.setCellWidget(row, self.COL_IF_MODE, combo)
+
+        combo.setEnabled(if_configurable)
+        combo.setToolTip(
+            "" if if_configurable
+            else "Network settings cannot be adjusted for this device type"
+        )
 
         # IP / Mask / Gateway / DNS cells
         for col, val in (
