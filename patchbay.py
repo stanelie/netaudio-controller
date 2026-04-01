@@ -1216,8 +1216,8 @@ class ClockStatusTab(QWidget):
     COL_NAME   = 0
     COL_IP     = 1
     COL_LEADER = 2
-    COL_ROLE   = 3
-    _HEADERS   = ["Device", "IP Address", "Preferred Leader", "Clock Role"]
+    COL_V1     = 3
+    _HEADERS   = ["Device", "IP Address", "Preferred Leader", "Primary V1"]
 
     def __init__(self):
         super().__init__()
@@ -1318,12 +1318,13 @@ class ClockStatusTab(QWidget):
         # Col 2: Preferred Leader checkbox (widget-in-cell, centred)
         self._set_leader_checkbox(row, sn, pm, configurable)
 
-        # Col 3: Clock role
-        it = QTableWidgetItem(self._clock_role(device))
+        # Col 3: Primary V1 clock leader
+        v1_text = "leader" if getattr(device, 'ptp_v1_role', None) == "Leader" else "—"
+        it = QTableWidgetItem(v1_text)
         it.setFlags(Qt.ItemFlag.ItemIsEnabled)
         it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         it.setForeground(QBrush(C_CLOCK_FG))
-        self._table.setItem(row, self.COL_ROLE, it)
+        self._table.setItem(row, self.COL_V1, it)
 
         self._apply_row_colour(row, sn)
 
@@ -1388,25 +1389,13 @@ class ClockStatusTab(QWidget):
                     chk.setChecked(bool(pm))
                     chk.blockSignals(False)
 
-            # Clock role text
-            role_it = self._table.item(row, self.COL_ROLE)
-            if role_it:
-                role_it.setText(self._clock_role(device))
+            # Primary V1 text
+            v1_it = self._table.item(row, self.COL_V1)
+            if v1_it:
+                cr = getattr(device, 'ptp_v1_role', None)
+                v1_it.setText("leader" if cr == "Leader" else "—")
 
             self._apply_row_colour(row, sn)
-
-    def _clock_role(self, device) -> str:
-        """Best-effort clock role label from whatever attribute the library exposes."""
-        for attr in ('is_clock_master', 'clock_master', 'is_master'):
-            v = getattr(device, attr, None)
-            if v is True:
-                return "Leader"
-            if v is False:
-                return "Follower"
-        pm = getattr(device, 'preferred_leader', None)
-        if pm is True:
-            return "Preferred"
-        return "—"
 
     def _apply_row_colour(self, row: int, sn: str):
         if sn in self._pending:
@@ -1414,7 +1403,7 @@ class ClockStatusTab(QWidget):
             colour = flash or C_PENDING_ROW
         else:
             colour = None
-        for col in (self.COL_NAME, self.COL_IP, self.COL_ROLE):
+        for col in (self.COL_NAME, self.COL_IP, self.COL_V1):
             it = self._table.item(row, col)
             if it:
                 if colour:
