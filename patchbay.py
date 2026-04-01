@@ -266,6 +266,11 @@ class DiscoveryWorker(QThread):
         source = "daemon-cache"
         if devices is None:
             source = "ARC full-query"
+            # Snapshot the identity of each device's services dict before
+            # discovery.  discover_and_populate assigns a fresh dict to
+            # device.services for every device it processes via mDNS, so
+            # entries whose services object is unchanged afterwards were not
+            # seen in this run (e.g. stale pre-rename ghost entries).
             print(f"[timing] {_elapsed():.2f}s  launching discover_and_populate  timeout={netaudio_settings.mdns_timeout}s")
             task = asyncio.create_task(
                 app.discover_and_populate(timeout=netaudio_settings.mdns_timeout)
@@ -280,6 +285,24 @@ class DiscoveryWorker(QThread):
                     self.partial_update.emit(dict(app.devices))
             print(f"[timing] {_elapsed():.2f}s  discover_and_populate done  devices={len(app.devices)}")
             devices = task.result()
+
+            # Sync device.name from the mDNS service instance name.
+            # discover_and_populate only fetches the name via ARC when
+            # device.name is empty, so renames made in Dante Controller are
+            # never picked up on subsequent runs.  The current name is already
+            # present in the service instance prefix (e.g.
+            # "NewName._netaudio-arc._udp.local." → "NewName").
+            for sn, d in app.devices.items():
+                if not d.services:
+                    continue
+                for service_key in d.services:
+                    dot = service_key.find('._')
+                    if dot > 0:
+                        mdns_name = service_key[:dot]
+                        if mdns_name != d.name:
+                            print(f"[name-sync] {sn!r}: {d.name!r} → {mdns_name!r}")
+                            d.name = mdns_name
+                        break
         else:
             print(f"[timing] {_elapsed():.2f}s  daemon cache hit  devices={len(devices)}")
             # Register daemon devices in app.devices so _device_by_ip can
@@ -289,6 +312,12 @@ class DiscoveryWorker(QThread):
             # same UDP socket (both use transaction_id=0 for command_receivers,
             # corrupting each other's asyncio.Future in _pending).
             for sn, d in devices.items():
+                if not getattr(d, 'online', True):
+                    # Daemon marks devices offline when they disappear from mDNS
+                    # (e.g. after a rename).  Drop them from the local cache so
+                    # the stale row disappears from the UI.
+                    app.devices.pop(sn, None)
+                    continue
                 if sn not in app.devices:
                     app.devices[sn] = d
                 else:
@@ -299,6 +328,9 @@ class DiscoveryWorker(QThread):
                     # restart, when the old app.devices entry would otherwise
                     # stay stale indefinitely.
                     existing = app.devices[sn]
+                    if d.name:
+                        existing.name = d.name
+                    existing.online = d.online
                     existing.subscriptions = d.subscriptions
                     if d.rx_channels:
                         existing.rx_channels = d.rx_channels
@@ -598,6 +630,36 @@ class RebootWorker(QThread):
                 await asyncio.sleep(0.1)
 
 
+# ── Device rename worker ──────────────────────────────────────────────────────
+class DeviceRenameWorker(QThread):
+    """Sends a device rename command via the ARC service."""
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, device, new_name: str):
+        super().__init__()
+        self._device   = device
+        self._new_name = new_name
+
+    def run(self):
+        future = _engine.submit(self._send())
+        try:
+            future.result(timeout=10)
+            self.done.emit(True, "")
+        except Exception as exc:
+            self.done.emit(False, str(exc))
+
+    async def _send(self):
+        cmds   = DanteDeviceCommands()
+        ip     = str(self._device.ipv4)
+        port   = _arc_port(self._device)
+        packet, _ = cmds.command_set_name(self._new_name)
+        result = await device_request_via_daemon(packet, ip, port)
+        if result is None:
+            await _engine.app.arc.request(
+                packet, ip, port, logical_command_name="set_name"
+            )
+
+
 # ── Patch bay table ────────────────────────────────────────────────────────────
 #
 # Table layout:
@@ -628,6 +690,8 @@ class PatchBayTable(QTableWidget):
         self._tx_exp         = {}  # device_name -> bool  (True = expanded)
         self._rx_exp         = {}
         self._last_devices   = {}
+        self._last_tx_fp: frozenset = frozenset()
+        self._last_rx_fp: frozenset = frozenset()
         self._workers        = []  # keep refs so GC doesn't kill running threads
 
         self.setItemDelegate(DotDelegate())
@@ -643,6 +707,16 @@ class PatchBayTable(QTableWidget):
     # ── Public ─────────────────────────────────────────────────────────────────
     def load(self, devices: dict):
         self._last_devices = devices
+        self._last_tx_fp = frozenset(
+            (d.name, ch.number)
+            for d in devices.values()
+            for ch in d.tx_channels.values()
+        )
+        self._last_rx_fp = frozenset(
+            (d.name, ch.number)
+            for d in devices.values()
+            for ch in d.rx_channels.values()
+        )
 
         # Build connection map from each device's subscription list
         self._conns = {}
@@ -915,19 +989,13 @@ class PatchBayTable(QTableWidget):
                         )
 
         # Compare current channel fingerprint to detect structural changes.
-        # Both sides must be derived from the full device set (not from
-        # _rx_struct/_tx_struct which only contain *expanded* rows) so that
-        # collapsed devices don't create a spurious mismatch on every cycle.
-        old_tx = frozenset(
-            (d.name, ch.number)
-            for d in self._last_devices.values()
-            for ch in d.tx_channels.values()
-        )
-        old_rx = frozenset(
-            (d.name, ch.number)
-            for d in self._last_devices.values()
-            for ch in d.rx_channels.values()
-        )
+        # Use stored fingerprints for the "before" side.  _last_devices may be
+        # the same dict object as `devices` (both point at app.devices which is
+        # mutated in-place), so recomputing old_tx from _last_devices would
+        # always equal new_tx — the stored frozensets are the only stable record
+        # of what the table was built from.
+        old_tx = self._last_tx_fp
+        old_rx = self._last_rx_fp
         new_tx = frozenset(
             (d.name, ch.number)
             for d in devices.values()
@@ -945,6 +1013,8 @@ class PatchBayTable(QTableWidget):
                       k[0], k[1], v[0], v[1], v[2] or 0, v[3])
 
         self._last_devices = devices
+        self._last_tx_fp   = new_tx
+        self._last_rx_fp   = new_rx
         self._conns = new_conns
 
         if old_tx != new_tx or old_rx != new_rx:
@@ -1331,6 +1401,9 @@ class ClockStatusTab(QWidget):
         # SNs whose interface config was applied but device not yet rebooted
         self._if_reboot_pending: set[str] = set()
         self._reboot_workers: list = []
+        # sn → new_name for uncommitted device renames
+        self._name_pending: dict[str, str] = {}
+        self._rename_workers: list = []
 
     # ── Public interface (called by PatchBayWindow) ────────────────────────────
 
@@ -1367,6 +1440,17 @@ class ClockStatusTab(QWidget):
             if old_sns != new_sns:
                 self._rebuild()
                 return
+        else:
+            # Same dict object (in-place mutation) — still detect sn set changes
+            # (e.g. device renamed externally: old sn removed, new sn added).
+            table_sns = {
+                self._table.item(r, self.COL_NAME).data(Qt.ItemDataRole.UserRole)
+                for r in range(self._table.rowCount())
+                if self._table.item(r, self.COL_NAME)
+            }
+            if set(self._devices.keys()) != table_sns:
+                self._rebuild()
+                return
 
         self._update_rows()
 
@@ -1395,12 +1479,8 @@ class ClockStatusTab(QWidget):
         pm           = getattr(device, 'preferred_leader', None)
         configurable = getattr(device, 'preferred_leader_configurable', None)
 
-        # Col 0: device name — stores sn in UserRole for later lookups
-        it = QTableWidgetItem(dev_name)
-        it.setFlags(Qt.ItemFlag.ItemIsEnabled)
-        it.setData(Qt.ItemDataRole.UserRole, sn)
-        it.setForeground(QBrush(C_CLOCK_FG))
-        self._table.setItem(row, self.COL_NAME, it)
+        # Col 0: editable device name
+        self._fill_name_cell(row, sn, device)
 
         # Col 1: IP address
         it = QTableWidgetItem(ip_str)
@@ -1458,6 +1538,92 @@ class ClockStatusTab(QWidget):
 
         self._table.setCellWidget(row, self.COL_LEADER, container)
 
+    # ── Device rename helpers ──────────────────────────────────────────────────
+
+    def _fill_name_cell(self, row: int, sn: str, device):
+        """Populate COL_NAME with an always-editable QLineEdit.
+
+        A hidden QTableWidgetItem carrying sn in UserRole stays in the cell so
+        that _row_for_sn() and _update_rows() can still find rows by sn via
+        item().  Qt keeps items and cell widgets independent, so both can coexist.
+        """
+        dev_name = device.name or sn
+
+        # Preserve the item (with UserRole) that _row_for_sn relies on.
+        it = self._table.item(row, self.COL_NAME)
+        if it is None:
+            it = QTableWidgetItem()
+            it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            it.setData(Qt.ItemDataRole.UserRole, sn)
+            self._table.setItem(row, self.COL_NAME, it)
+
+        pending_name = self._name_pending.get(sn)
+        display_name = pending_name if pending_name is not None else dev_name
+
+        # If the existing widget already shows the right text and state, leave it
+        # alone.  Replacing the widget on every _update_rows call causes the cell
+        # to briefly blank out (flash) each time a clock-refresh or auto-refresh
+        # fires.
+        existing_le = self._table.cellWidget(row, self.COL_NAME)
+        if (isinstance(existing_le, QLineEdit)
+                and existing_le.text() == display_name
+                and (pending_name is not None) == ("background: white" in existing_le.styleSheet())):
+            return
+
+        le = QLineEdit(display_name)
+        le.setFrame(False)
+        if pending_name is not None:
+            le.setStyleSheet("background: white; color: #191919;")
+        else:
+            le.setStyleSheet(
+                "QLineEdit { background: transparent; color: #191919; border: none; }"
+            )
+        le.textChanged.connect(
+            lambda text, s=sn, orig=dev_name: self._on_name_changed(s, text, orig)
+        )
+        le.editingFinished.connect(lambda s=sn: self._on_name_editing_finished(s))
+        self._table.setCellWidget(row, self.COL_NAME, le)
+
+    def _on_name_changed(self, sn: str, text: str, original: str):
+        if text == original:
+            self._name_pending.pop(sn, None)
+        else:
+            self._name_pending[sn] = text
+        # Update only the QLineEdit's visual style — no cell rebuilds needed.
+        row = self._row_for_sn(sn)
+        if row >= 0:
+            w = self._table.cellWidget(row, self.COL_NAME)
+            if isinstance(w, QLineEdit):
+                if sn in self._name_pending:
+                    w.setStyleSheet("background: white; color: #191919;")
+                else:
+                    w.setStyleSheet(
+                        "QLineEdit { background: transparent; color: #191919; border: none; }"
+                    )
+
+    def _on_name_editing_finished(self, sn: str):
+        """Triggered when the user presses Enter or leaves the name field."""
+        if sn not in self._name_pending:
+            return   # text wasn't changed — nothing to do
+        from netaudio.dante.device_operations import validate_dante_name
+        device   = self._devices.get(sn)
+        new_name = self._name_pending[sn]
+        if device is None:
+            return
+        error = validate_dante_name(new_name)
+        if error:
+            QMessageBox.warning(self, "Invalid Name", error)
+            # Revert the field to the current device name.
+            self._name_pending.pop(sn, None)
+            row = self._row_for_sn(sn)
+            if row >= 0:
+                self._fill_name_cell(row, sn, device)
+            return
+        w = DeviceRenameWorker(device, new_name)
+        w.done.connect(lambda ok, msg, s=sn: self._on_rename_done(s, ok, msg))
+        self._rename_workers.append(w)
+        w.start()
+
     # ── Interface config helpers ───────────────────────────────────────────────
 
     @staticmethod
@@ -1505,17 +1671,22 @@ class ClockStatusTab(QWidget):
             display_dns  = self._if_corrected(iface0, "dns_server")
             editable     = False
 
-        # Mode combo — block signals while populating to avoid a spurious
-        # currentTextChanged emission before the handler is connected.
-        combo = QComboBox()
-        combo.blockSignals(True)
-        combo.addItems(["dynamic", "static"])
-        combo.setCurrentIndex(1 if display_mode == "static" else 0)
-        combo.blockSignals(False)
-        combo.currentTextChanged.connect(
-            lambda mode, s=sn: self._on_if_mode_changed(s, mode)
-        )
-        self._table.setCellWidget(row, self.COL_IF_MODE, combo)
+        # Mode combo — reuse the existing QComboBox if it already shows the
+        # right value; replacing it on every _update_rows call causes the cell
+        # to flash (the old widget is destroyed, the new one painted late).
+        existing_combo = self._table.cellWidget(row, self.COL_IF_MODE)
+        if isinstance(existing_combo, QComboBox) and existing_combo.currentText() == display_mode:
+            combo = existing_combo
+        else:
+            combo = QComboBox()
+            combo.blockSignals(True)
+            combo.addItems(["dynamic", "static"])
+            combo.setCurrentIndex(1 if display_mode == "static" else 0)
+            combo.blockSignals(False)
+            combo.currentTextChanged.connect(
+                lambda mode, s=sn: self._on_if_mode_changed(s, mode)
+            )
+            self._table.setCellWidget(row, self.COL_IF_MODE, combo)
 
         # IP / Mask / Gateway / DNS cells
         for col, val in (
@@ -1525,37 +1696,52 @@ class ClockStatusTab(QWidget):
             (self.COL_IF_DNS,  display_dns),
         ):
             if editable:
-                le = QLineEdit(val)
-                le.setFrame(False)
-                le.setStyleSheet("background: white; color: #191919;")
-                self._table.setCellWidget(row, col, le)
+                existing_le = self._table.cellWidget(row, col)
+                if isinstance(existing_le, QLineEdit) and existing_le.text() == val:
+                    pass  # already correct — don't replace
+                else:
+                    le = QLineEdit(val)
+                    le.setFrame(False)
+                    le.setStyleSheet("background: white; color: #191919;")
+                    self._table.setCellWidget(row, col, le)
             else:
-                self._table.setCellWidget(row, col, None)
-                it = QTableWidgetItem(val if val else "—")
-                it.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                it.setForeground(QBrush(C_CLOCK_FG))
-                self._table.setItem(row, col, it)
+                display_val = val if val else "—"
+                existing_w  = self._table.cellWidget(row, col)
+                existing_it = self._table.item(row, col)
+                if existing_w is not None or existing_it is None or existing_it.text() != display_val:
+                    self._table.setCellWidget(row, col, None)
+                    it = QTableWidgetItem(display_val)
+                    it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    it.setForeground(QBrush(C_CLOCK_FG))
+                    self._table.setItem(row, col, it)
 
         # Apply / status cell — three states:
-        #   pending edit  → "Apply" button
+        #   pending edit  → "Apply" button  (interface config OR rename pending)
         #   reboot needed → "Pending reboot" label
         #   idle          → empty
         if pending:
-            self._table.setCellWidget(row, self.COL_APPLY, None)
-            btn = QPushButton("Apply")
-            btn.clicked.connect(lambda _, s=sn: self._on_if_apply(s))
-            self._table.setCellWidget(row, self.COL_APPLY, btn)
+            existing_btn = self._table.cellWidget(row, self.COL_APPLY)
+            if not isinstance(existing_btn, QPushButton):
+                self._table.setCellWidget(row, self.COL_APPLY, None)
+                btn = QPushButton("Apply")
+                btn.clicked.connect(lambda _, s=sn: self._on_apply(s))
+                self._table.setCellWidget(row, self.COL_APPLY, btn)
         elif sn in self._if_reboot_pending:
-            self._table.setCellWidget(row, self.COL_APPLY, None)
-            it = QTableWidgetItem("Pending reboot")
-            it.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            it.setForeground(QBrush(QColor(180, 100, 0)))   # amber
-            self._table.setItem(row, self.COL_APPLY, it)
+            existing_it = self._table.item(row, self.COL_APPLY)
+            if existing_it is None or existing_it.text() != "Pending reboot":
+                self._table.setCellWidget(row, self.COL_APPLY, None)
+                it = QTableWidgetItem("Pending reboot")
+                it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                it.setForeground(QBrush(QColor(180, 100, 0)))   # amber
+                self._table.setItem(row, self.COL_APPLY, it)
         else:
-            self._table.setCellWidget(row, self.COL_APPLY, None)
-            it = QTableWidgetItem("")
-            it.setFlags(Qt.ItemFlag.ItemIsEnabled)
-            self._table.setItem(row, self.COL_APPLY, it)
+            existing_w = self._table.cellWidget(row, self.COL_APPLY)
+            existing_it = self._table.item(row, self.COL_APPLY)
+            if existing_w is not None or existing_it is None or existing_it.text() != "":
+                self._table.setCellWidget(row, self.COL_APPLY, None)
+                it = QTableWidgetItem("")
+                it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self._table.setItem(row, self.COL_APPLY, it)
 
     def _row_for_sn(self, sn: str) -> int:
         for row in range(self._table.rowCount()):
@@ -1612,33 +1798,50 @@ class ClockStatusTab(QWidget):
             self._fill_if_cells(row, sn, device)
             self._table.setColumnWidth(self.COL_APPLY, 70)
 
-    def _on_if_apply(self, sn: str):
+    def _on_apply(self, sn: str):
+        """Apply pending interface config for this device."""
         device  = self._devices.get(sn)
-        pending = self._if_pending.get(sn)
-        if device is None or pending is None:
+        if device is None:
             return
 
-        # Read any edits the user made directly in the QLineEdit cells.
-        row = self._row_for_sn(sn)
-        if row >= 0 and pending["mode"] == "static":
-            for col, key in (
-                (self.COL_IF_IP,   "ip"),
-                (self.COL_IF_MASK, "mask"),
-                (self.COL_IF_GW,   "gw"),
-                (self.COL_IF_DNS,  "dns"),
-            ):
-                w = self._table.cellWidget(row, col)
-                if isinstance(w, QLineEdit):
-                    pending[key] = w.text().strip()
+        pending = self._if_pending.get(sn)
+        if pending is not None:
+            row = self._row_for_sn(sn)
+            if row >= 0 and pending["mode"] == "static":
+                for col, key in (
+                    (self.COL_IF_IP,   "ip"),
+                    (self.COL_IF_MASK, "mask"),
+                    (self.COL_IF_GW,   "gw"),
+                    (self.COL_IF_DNS,  "dns"),
+                ):
+                    w = self._table.cellWidget(row, col)
+                    if isinstance(w, QLineEdit):
+                        pending[key] = w.text().strip()
+            w = InterfaceConfigWorker(
+                device, pending["mode"],
+                pending.get("ip", ""), pending.get("mask", ""),
+                pending.get("gw", ""),  pending.get("dns", ""),
+            )
+            w.done.connect(lambda ok, msg, s=sn: self._on_if_done(s, ok, msg))
+            self._if_workers.append(w)
+            w.start()
 
-        w = InterfaceConfigWorker(
-            device, pending["mode"],
-            pending.get("ip", ""), pending.get("mask", ""),
-            pending.get("gw", ""),  pending.get("dns", ""),
-        )
-        w.done.connect(lambda ok, msg, s=sn: self._on_if_done(s, ok, msg))
-        self._if_workers.append(w)
-        w.start()
+    def _on_rename_done(self, sn: str, ok: bool, msg: str):
+        if ok:
+            new_name = self._name_pending.pop(sn, None)
+            row      = self._row_for_sn(sn)
+            device   = self._devices.get(sn)
+            if row >= 0 and device is not None:
+                # Optimistically reflect the new name before mDNS confirms it.
+                # Without this, the field reverts to the old name until the next
+                # discovery cycle (which may never update the same sn key if the
+                # device's mDNS service name changes with the rename).
+                if new_name:
+                    device.name = new_name
+                self._fill_name_cell(row, sn, device)
+        else:
+            QMessageBox.warning(self, "Rename Failed", f"Failed to rename device:\n{msg}")
+        self._rename_workers = [w for w in self._rename_workers if w.isRunning()]
 
     def _on_if_done(self, sn: str, ok: bool, msg: str):
         if ok:
@@ -1716,6 +1919,12 @@ class ClockStatusTab(QWidget):
                     chk.blockSignals(True)
                     chk.setChecked(bool(pm))
                     chk.blockSignals(False)
+
+            # Device name — skip if the user has an uncommitted rename or is typing.
+            if sn not in self._name_pending:
+                name_w = self._table.cellWidget(row, self.COL_NAME)
+                if not (isinstance(name_w, QLineEdit) and name_w.hasFocus()):
+                    self._fill_name_cell(row, sn, device)
 
             # Primary V1 text
             v1_it = self._table.item(row, self.COL_V1)
