@@ -598,6 +598,37 @@ class InterfaceConfigWorker(QThread):
             )
 
 
+# ── Sample rate worker ─────────────────────────────────────────────────────────
+_SR_VALID_RATES = [44100, 48000, 88200, 96000, 176400, 192000]
+
+class SampleRateWorker(QThread):
+    """Sends a sample-rate change command to a device."""
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, device, sample_rate: int):
+        super().__init__()
+        self._device      = device
+        self._sample_rate = sample_rate
+
+    def run(self):
+        future = _engine.submit(self._send())
+        try:
+            future.result(timeout=10)
+            self.done.emit(True, "")
+        except Exception as exc:
+            self.done.emit(False, str(exc))
+
+    async def _send(self):
+        cmds   = DanteDeviceCommands()
+        ip     = str(self._device.ipv4)
+        packet, _, port = cmds.command_set_sample_rate(self._sample_rate)
+        result = await device_request_via_daemon(packet, ip, port)
+        if result is None:
+            await _engine.app.settings.request(
+                packet, ip, port, logical_command_name="set_sample_rate"
+            )
+
+
 # ── Reboot worker ──────────────────────────────────────────────────────────────
 class RebootWorker(QThread):
     """Sends a reboot command to a device."""
@@ -1362,14 +1393,15 @@ class ClockStatusTab(QWidget):
 
     COL_NAME      = 0
     COL_LEADER    = 1
-    COL_IF_MODE   = 2
-    COL_IF_IP     = 3
-    COL_IF_MASK   = 4
-    COL_IF_GW     = 5
-    COL_IF_DNS    = 6
-    COL_APPLY     = 7
-    COL_REBOOT    = 8
-    _HEADERS      = ["Device", "Preferred Leader",
+    COL_SR        = 2
+    COL_IF_MODE   = 3
+    COL_IF_IP     = 4
+    COL_IF_MASK   = 5
+    COL_IF_GW     = 6
+    COL_IF_DNS    = 7
+    COL_APPLY     = 8
+    COL_REBOOT    = 9
+    _HEADERS      = ["Device", "Preferred Leader", "Sample Rate",
                      "Mode", "Interface IP", "Netmask", "Gateway", "DNS Server", "", ""]
 
     def __init__(self):
@@ -1402,6 +1434,7 @@ class ClockStatusTab(QWidget):
         # sn → new_name for uncommitted device renames
         self._name_pending: dict[str, str] = {}
         self._rename_workers: list = []
+        self._sr_workers: list = []
 
     # ── Public interface (called by PatchBayWindow) ────────────────────────────
 
@@ -1483,7 +1516,10 @@ class ClockStatusTab(QWidget):
         v1_role = getattr(device, 'ptp_v1_role', None)
         self._set_leader_checkbox(row, sn, pm, configurable, v1_role)
 
-        # Cols 3–8: network interface widgets (mode dropdown, editable fields, apply button)
+        # Col 2: Sample rate dropdown
+        self._fill_sr_cell(row, sn, device)
+
+        # Cols 3–9: network interface widgets (mode dropdown, editable fields, apply button)
         self._fill_if_cells(row, sn, device)
 
         # Col 10: Reboot button
@@ -1632,6 +1668,68 @@ class ClockStatusTab(QWidget):
         _DYNAMIC_SWAP = {"gateway": "dns_server", "dns_server": "gateway"}
         k = _DYNAMIC_SWAP.get(key, key) if iface.get("mode") == "dynamic" else key
         return iface.get(k, "")
+
+    def _fill_sr_cell(self, row: int, sn: str, device):
+        """Populate COL_SR with a sample-rate combo for devices that report one."""
+        sr = getattr(device, 'sample_rate', None)
+        if sr is None:
+            existing_w = self._table.cellWidget(row, self.COL_SR)
+            existing_it = self._table.item(row, self.COL_SR)
+            if existing_w is not None or existing_it is None or existing_it.text() != "—":
+                self._table.setCellWidget(row, self.COL_SR, None)
+                it = QTableWidgetItem("—")
+                it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                it.setForeground(QBrush(C_CLOCK_FG))
+                self._table.setItem(row, self.COL_SR, it)
+            return
+
+        sr_str = str(sr)
+        existing = self._table.cellWidget(row, self.COL_SR)
+        if isinstance(existing, QComboBox):
+            if existing.currentText() != sr_str:
+                existing.blockSignals(True)
+                idx = existing.findText(sr_str)
+                if idx >= 0:
+                    existing.setCurrentIndex(idx)
+                existing.blockSignals(False)
+        else:
+            combo = QComboBox()
+            combo.blockSignals(True)
+            for rate in _SR_VALID_RATES:
+                combo.addItem(str(rate))
+            idx = combo.findText(sr_str)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+            combo.currentTextChanged.connect(
+                lambda rate_str, s=sn: self._on_sr_changed(s, int(rate_str))
+            )
+            self._table.setCellWidget(row, self.COL_SR, combo)
+
+    def _on_sr_changed(self, sn: str, new_rate: int):
+        device = self._devices.get(sn)
+        if device is None:
+            return
+        if getattr(device, 'sample_rate', None) == new_rate:
+            return
+        w = SampleRateWorker(device, new_rate)
+        w.done.connect(lambda ok, msg, s=sn, r=new_rate: self._on_sr_done(s, r, ok, msg))
+        self._sr_workers.append(w)
+        w.start()
+
+    def _on_sr_done(self, sn: str, rate: int, ok: bool, msg: str):
+        if ok:
+            device = self._devices.get(sn)
+            if device is not None:
+                device.sample_rate = rate
+                row = self._row_for_sn(sn)
+                if row >= 0:
+                    self._fill_sr_cell(row, sn, device)
+        else:
+            QMessageBox.warning(
+                self, "Sample Rate Failed", f"Failed to set sample rate:\n{msg}"
+            )
+        self._sr_workers = [w for w in self._sr_workers if w.isRunning()]
 
     def _fill_if_cells(self, row: int, sn: str, device):
         """Populate cols COL_IF_MODE … COL_APPLY for one row.
@@ -1949,6 +2047,12 @@ class ClockStatusTab(QWidget):
                     pm           = getattr(device, 'preferred_leader', None)
                     configurable = getattr(device, 'preferred_leader_configurable', None)
                     self._set_leader_checkbox(row, sn, pm, configurable, cr)
+
+            # Sample rate — skip if the user has the dropdown open.
+            sr_combo = self._table.cellWidget(row, self.COL_SR)
+            if not (isinstance(sr_combo, QComboBox) and
+                    (sr_combo.hasFocus() or sr_combo.view().isVisible())):
+                self._fill_sr_cell(row, sn, device)
 
             # Interface columns — skip if the user is actively interacting with
             # this row (typing in a field or a combo dropdown is open) so we
