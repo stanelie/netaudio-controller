@@ -19,6 +19,7 @@ from PyQt6.QtGui import QColor, QFont, QBrush, QPainter, QPen
 from netaudio.daemon.client import get_devices_from_daemon, device_request_via_daemon
 from netaudio.dante.application import DanteApplication
 from netaudio.dante.device_commands import DanteDeviceCommands
+from netaudio.dante.protocol import DantePacket, DanteParser
 from netaudio.dante.const import SUBSCRIPTION_STATUS_INFO
 from netaudio.dante.events import EventType
 from netaudio.dante.services.notification import (
@@ -538,19 +539,151 @@ class ClockRefreshWorker(QThread):
             print(f"[clock-refresh] worker top-level exception: {exc!r}")
 
     async def _fetch(self):
+        import time as _time
+        _t0 = _time.monotonic()
+        def _e(): return _time.monotonic() - _t0
+
         app = _engine.app
 
         async def _probe_one(sn, ip):
+            _pt = _time.monotonic()
             try:
                 await app.probe_preferred_leader_state(ip, timeout=1.5)
+                print(f"[clock-refresh] {_e():.2f}s  probe_preferred_leader_state {sn!r} done ({_time.monotonic()-_pt:.2f}s)", flush=True)
             except Exception as exc:
-                log.debug("[clock-refresh] probe failed for %r (%s): %s", sn, ip, exc)
+                print(f"[clock-refresh] {_e():.2f}s  probe_preferred_leader_state {sn!r} failed ({_time.monotonic()-_pt:.2f}s): {exc}", flush=True)
 
         ips = [(sn, str(device.ipv4))
                for sn, device in self._devices.items()
                if getattr(device, 'ipv4', None)]
+        print(f"[clock-refresh] {_e():.2f}s  probing preferred_leader for {len(ips)} device(s)", flush=True)
         # Probe all devices concurrently so total time ≈ one round-trip, not N×timeout.
         await asyncio.gather(*(_probe_one(sn, ip) for sn, ip in ips))
+        print(f"[clock-refresh] {_e():.2f}s  all preferred_leader probes done", flush=True)
+
+        # Devices that didn't receive a CONMON multicast (e.g. Dante Via software)
+        # won't have ptp_v1_role set. Fall back to a unicast get_clocking_status()
+        # call so their actual clock role is still displayed.
+        async def _clocking_one(sn, device):
+            _ct = _time.monotonic()
+            try:
+                await device.get_clocking_status()
+                print(f"[clock-refresh] {_e():.2f}s  get_clocking_status {sn!r} done ({_time.monotonic()-_ct:.2f}s)", flush=True)
+            except Exception as exc:
+                print(f"[clock-refresh] {_e():.2f}s  get_clocking_status {sn!r} failed ({_time.monotonic()-_ct:.2f}s): {exc}", flush=True)
+
+        missing = [
+            (sn, device)
+            for sn, device in self._devices.items()
+            if getattr(device, 'ptp_v1_role', None) is None
+            and getattr(device, 'ipv4', None)
+        ]
+        if missing:
+            print(f"[clock-refresh] {_e():.2f}s  fetching clocking_status for {len(missing)} device(s) missing ptp_v1_role", flush=True)
+            await asyncio.gather(*(_clocking_one(sn, d) for sn, d in missing))
+
+        print(f"[clock-refresh] {_e():.2f}s  fetch complete", flush=True)
+        return self._devices
+
+
+# ── Latency read worker ────────────────────────────────────────────────────────
+class LatencyReadWorker(QThread):
+    """Queries each device's current latency via ARC and stores it in device.latency (ns).
+
+    Works on the same device objects held by the routing table, so written
+    fields are visible immediately when the table refreshes.
+    """
+    done = pyqtSignal(dict)
+
+    def __init__(self, devices: dict):
+        super().__init__()
+        self._devices = devices
+
+    def run(self):
+        future = _engine.submit(self._fetch())
+        try:
+            self.done.emit(future.result(timeout=30))
+        except Exception as exc:
+            print(f"[latency-read] worker top-level exception: {exc!r}")
+
+    async def _fetch(self):
+        import time as _time
+        _t0 = _time.monotonic()
+        def _e(): return _time.monotonic() - _t0
+
+        cmds = DanteDeviceCommands()
+
+        async def _probe_one(sn, device):
+            ip = str(device.ipv4)
+            port = _arc_port(device)
+            _pt = _time.monotonic()
+            try:
+                packet = cmds.command_device_settings()[0]
+                response = await _engine.app.arc.request(
+                    packet, ip, port, logical_command_name="get_device_settings"
+                )
+                if response:
+                    settings = DanteParser.parse_device_settings(
+                        DantePacket.parse_response(response)
+                    )
+                    if settings.latency_us is not None:
+                        device.latency = settings.latency_us
+                        print(f"[latency-read] {_e():.2f}s  {sn!r}  latency={settings.latency_us/1_000_000:.3f}ms  ({_time.monotonic()-_pt:.2f}s)", flush=True)
+                    else:
+                        print(f"[latency-read] {_e():.2f}s  {sn!r}  no latency in response  ({_time.monotonic()-_pt:.2f}s)", flush=True)
+                else:
+                    print(f"[latency-read] {_e():.2f}s  {sn!r}  no response  ({_time.monotonic()-_pt:.2f}s)", flush=True)
+            except Exception as exc:
+                print(f"[latency-read] {_e():.2f}s  {sn!r}  error ({_time.monotonic()-_pt:.2f}s): {exc}", flush=True)
+
+        devices_with_ip = [
+            (sn, device)
+            for sn, device in self._devices.items()
+            if getattr(device, 'ipv4', None)
+        ]
+        print(f"[latency-read] {_e():.2f}s  probing {len(devices_with_ip)} device(s)", flush=True)
+        await asyncio.gather(*(_probe_one(sn, d) for sn, d in devices_with_ip))
+        print(f"[latency-read] {_e():.2f}s  fetch complete", flush=True)
+        return self._devices
+
+
+# ── Config probe worker ────────────────────────────────────────────────────────
+class ConfigProbeWorker(QThread):
+    """Runs the slow notification-based probes in parallel after discovery.
+
+    discover_and_populate() no longer calls these so the patch tab can appear
+    immediately after ARC queries finish.  This worker runs them concurrently
+    (total wall time ≈ max of each individual timeout rather than their sum)
+    and signals done when all have returned.
+    """
+    done = pyqtSignal(dict)
+
+    def __init__(self, devices: dict):
+        super().__init__()
+        self._devices = devices
+
+    def run(self):
+        future = _engine.submit(self._fetch())
+        try:
+            self.done.emit(future.result(timeout=30))
+        except Exception as exc:
+            print(f"[config-probe] worker top-level exception: {exc!r}", flush=True)
+
+    async def _fetch(self):
+        import time as _time
+        _t0 = _time.monotonic()
+        def _e(): return _time.monotonic() - _t0
+
+        app = _engine.app
+        print(f"[config-probe] {_e():.2f}s  start", flush=True)
+        await asyncio.gather(
+            app._query_conmon_all(),
+            app._probe_interface_status(),
+            app._probe_preferred_leader_all(),
+            app._probe_aes67_all(),
+            return_exceptions=True,
+        )
+        print(f"[config-probe] {_e():.2f}s  all probes done", flush=True)
         return self._devices
 
 
@@ -601,6 +734,10 @@ class InterfaceConfigWorker(QThread):
 # ── Sample rate worker ─────────────────────────────────────────────────────────
 _SR_VALID_RATES = [44100, 48000, 88200, 96000, 176400, 192000]
 
+# ── Latency worker ─────────────────────────────────────────────────────────────
+# Values in milliseconds — these are the standard Dante Controller options.
+_LAT_VALID_MS = [0.25, 0.5, 1.0, 2.0, 5.0, 10.0]
+
 class SampleRateWorker(QThread):
     """Sends a sample-rate change command to a device."""
     done = pyqtSignal(bool, str)
@@ -626,6 +763,35 @@ class SampleRateWorker(QThread):
         if result is None:
             await _engine.app.settings.request(
                 packet, ip, port, logical_command_name="set_sample_rate"
+            )
+
+
+class LatencyWorker(QThread):
+    """Sends a latency change command to a device."""
+    done = pyqtSignal(bool, str)
+
+    def __init__(self, device, latency_ms: float):
+        super().__init__()
+        self._device     = device
+        self._latency_ms = latency_ms
+
+    def run(self):
+        future = _engine.submit(self._send())
+        try:
+            future.result(timeout=10)
+            self.done.emit(True, "")
+        except Exception as exc:
+            self.done.emit(False, str(exc))
+
+    async def _send(self):
+        cmds   = DanteDeviceCommands()
+        ip     = str(self._device.ipv4)
+        port   = _arc_port(self._device)
+        packet, _ = cmds.command_set_latency(self._latency_ms)
+        result = await device_request_via_daemon(packet, ip, port)
+        if result is None:
+            await _engine.app.arc.request(
+                packet, ip, port, logical_command_name="set_latency"
             )
 
 
@@ -1394,14 +1560,15 @@ class ClockStatusTab(QWidget):
     COL_NAME      = 0
     COL_LEADER    = 1
     COL_SR        = 2
-    COL_IF_MODE   = 3
-    COL_IF_IP     = 4
-    COL_IF_MASK   = 5
-    COL_IF_GW     = 6
-    COL_IF_DNS    = 7
-    COL_APPLY     = 8
-    COL_REBOOT    = 9
-    _HEADERS      = ["Device", "Preferred Leader", "Sample Rate",
+    COL_LAT       = 3
+    COL_IF_MODE   = 4
+    COL_IF_IP     = 5
+    COL_IF_MASK   = 6
+    COL_IF_GW     = 7
+    COL_IF_DNS    = 8
+    COL_APPLY     = 9
+    COL_REBOOT    = 10
+    _HEADERS      = ["Device", "Preferred Leader", "Sample Rate", "Latency",
                      "Mode", "Interface IP", "Netmask", "Gateway", "DNS Server", "", ""]
 
     def __init__(self):
@@ -1435,6 +1602,7 @@ class ClockStatusTab(QWidget):
         self._name_pending: dict[str, str] = {}
         self._rename_workers: list = []
         self._sr_workers: list = []
+        self._lat_workers: list = []
 
     # ── Public interface (called by PatchBayWindow) ────────────────────────────
 
@@ -1498,6 +1666,12 @@ class ClockStatusTab(QWidget):
         items = self._sorted_items()
         self._table.setRowCount(len(items))
         for row, (sn, device) in enumerate(items):
+            log.debug(
+                "device %s (%s) services: %s",
+                device.name or sn, sn,
+                {svc: props.get("properties", {})
+                 for svc, props in (device.services or {}).items()},
+            )
             self._fill_row(row, sn, device)
         self._table.resizeColumnsToContents()
         self._table.setColumnWidth(self.COL_LEADER, 170)
@@ -1513,13 +1687,21 @@ class ClockStatusTab(QWidget):
         self._fill_name_cell(row, sn, device)
 
         # Col 1: Preferred Leader checkbox (widget-in-cell, centred) + V1 role label
-        v1_role = getattr(device, 'ptp_v1_role', None)
+        # Use ptp_v1_role from CONMON multicast; fall back to clock_role from
+        # unicast probe for devices (e.g. Dante Via) that don't send multicast.
+        _clock_role = getattr(device, 'clock_role', None)
+        v1_role = getattr(device, 'ptp_v1_role', None) or (
+            _clock_role.title() if _clock_role else None
+        )
         self._set_leader_checkbox(row, sn, pm, configurable, v1_role)
 
         # Col 2: Sample rate dropdown
         self._fill_sr_cell(row, sn, device)
 
-        # Cols 3–9: network interface widgets (mode dropdown, editable fields, apply button)
+        # Col 3: Latency dropdown
+        self._fill_lat_cell(row, sn, device)
+
+        # Cols 4–10: network interface widgets (mode dropdown, editable fields, apply button)
         self._fill_if_cells(row, sn, device)
 
         # Col 10: Reboot button
@@ -1541,7 +1723,7 @@ class ClockStatusTab(QWidget):
         hbox.setContentsMargins(6, 0, 0, 0)
         hbox.setSpacing(6)
 
-        if pm is None or configurable is False:
+        if (pm is None or configurable is False) and v1_role != "Leader":
             lbl = QLabel("Follower only")
             lbl.setStyleSheet(f"color: rgb({C_CLOCK_FG.red()},{C_CLOCK_FG.green()},{C_CLOCK_FG.blue()});")
             lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
@@ -1730,6 +1912,89 @@ class ClockStatusTab(QWidget):
                 self, "Sample Rate Failed", f"Failed to set sample rate:\n{msg}"
             )
         self._sr_workers = [w for w in self._sr_workers if w.isRunning()]
+
+    def _fill_lat_cell(self, row: int, sn: str, device):
+        """Populate COL_LAT with a latency combo.
+
+        Shown for any device that has a known sample rate (i.e. a proper Dante
+        audio device).  If the current latency hasn't been reported via mDNS
+        yet (device.latency is None) the combo is still created with no item
+        pre-selected.
+        """
+        # Gate on sample_rate: if the device doesn't have one it's not a
+        # full Dante audio node (e.g. a pure control device) and we hide the
+        # column.  latency_ns is not reliably present in all mDNS records so
+        # we don't gate on device.latency.
+        if getattr(device, 'sample_rate', None) is None:
+            existing_w  = self._table.cellWidget(row, self.COL_LAT)
+            existing_it = self._table.item(row, self.COL_LAT)
+            if existing_w is not None or existing_it is None or existing_it.text() != "—":
+                self._table.setCellWidget(row, self.COL_LAT, None)
+                it = QTableWidgetItem("—")
+                it.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                it.setForeground(QBrush(C_CLOCK_FG))
+                self._table.setItem(row, self.COL_LAT, it)
+            return
+
+        lat_ns = getattr(device, 'latency', None)
+        # Convert nanoseconds → milliseconds for list matching, if known.
+        if lat_ns is not None:
+            lat_ms = lat_ns / 1_000_000
+            lat_str = next(
+                (f"{v:g} ms" for v in _LAT_VALID_MS if abs(v - lat_ms) < 0.001),
+                f"{lat_ms:g} ms",
+            )
+        else:
+            lat_str = None   # unknown — leave combo with no pre-selection
+
+        existing = self._table.cellWidget(row, self.COL_LAT)
+        if isinstance(existing, QComboBox):
+            if lat_str is not None and existing.currentText() != lat_str:
+                existing.blockSignals(True)
+                idx = existing.findText(lat_str)
+                if idx >= 0:
+                    existing.setCurrentIndex(idx)
+                existing.blockSignals(False)
+        else:
+            combo = QComboBox()
+            combo.blockSignals(True)
+            for v in _LAT_VALID_MS:
+                combo.addItem(f"{v:g} ms")
+            if lat_str is not None:
+                idx = combo.findText(lat_str)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+            combo.currentTextChanged.connect(
+                lambda text, s=sn: self._on_lat_changed(s, float(text.split()[0]))
+            )
+            self._table.setCellWidget(row, self.COL_LAT, combo)
+
+    def _on_lat_changed(self, sn: str, new_lat_ms: float):
+        device = self._devices.get(sn)
+        if device is None:
+            return
+        lat_ns = getattr(device, 'latency', None)
+        if lat_ns is not None and abs(lat_ns / 1_000_000 - new_lat_ms) < 0.001:
+            return
+        w = LatencyWorker(device, new_lat_ms)
+        w.done.connect(lambda ok, msg, s=sn, v=new_lat_ms: self._on_lat_done(s, v, ok, msg))
+        self._lat_workers.append(w)
+        w.start()
+
+    def _on_lat_done(self, sn: str, lat_ms: float, ok: bool, msg: str):
+        if ok:
+            device = self._devices.get(sn)
+            if device is not None:
+                device.latency = int(lat_ms * 1_000_000)
+                row = self._row_for_sn(sn)
+                if row >= 0:
+                    self._fill_lat_cell(row, sn, device)
+        else:
+            QMessageBox.warning(
+                self, "Latency Failed", f"Failed to set latency:\n{msg}"
+            )
+        self._lat_workers = [w for w in self._lat_workers if w.isRunning()]
 
     def _fill_if_cells(self, row: int, sn: str, device):
         """Populate cols COL_IF_MODE … COL_APPLY for one row.
@@ -2009,7 +2274,10 @@ class ClockStatusTab(QWidget):
             if sn not in self._pending:
                 pm           = getattr(device, 'preferred_leader', None)
                 configurable = getattr(device, 'preferred_leader_configurable', None)
-                v1_role      = getattr(device, 'ptp_v1_role', None)
+                _clock_role  = getattr(device, 'clock_role', None)
+                v1_role      = getattr(device, 'ptp_v1_role', None) or (
+                    _clock_role.title() if _clock_role else None
+                )
 
                 should_show_label = pm is None or configurable is False
                 container = self._table.cellWidget(row, self.COL_LEADER)
@@ -2032,7 +2300,10 @@ class ClockStatusTab(QWidget):
                     self._fill_name_cell(row, sn, device)
 
             # Primary V1 label (appears only when device is V1 leader)
-            cr = getattr(device, 'ptp_v1_role', None)
+            _cr_clock = getattr(device, 'clock_role', None)
+            cr = getattr(device, 'ptp_v1_role', None) or (
+                _cr_clock.title() if _cr_clock else None
+            )
             container = self._table.cellWidget(row, self.COL_LEADER)
             if container:
                 v1_lbl = container.findChild(QLabel, "v1_lbl")
@@ -2053,6 +2324,12 @@ class ClockStatusTab(QWidget):
             if not (isinstance(sr_combo, QComboBox) and
                     (sr_combo.hasFocus() or sr_combo.view().isVisible())):
                 self._fill_sr_cell(row, sn, device)
+
+            # Latency — skip if the user has the dropdown open.
+            lat_combo = self._table.cellWidget(row, self.COL_LAT)
+            if not (isinstance(lat_combo, QComboBox) and
+                    (lat_combo.hasFocus() or lat_combo.view().isVisible())):
+                self._fill_lat_cell(row, sn, device)
 
             # Interface columns — skip if the user is actively interacting with
             # this row (typing in a field or a combo dropdown is open) so we
@@ -2273,6 +2550,8 @@ class PatchBayWindow(QMainWindow):
         self._discovery_worker: DiscoveryWorker | None = None
         self._bg_worker: DiscoveryWorker | None = None
         self._clock_worker: ClockRefreshWorker | None = None
+        self._lat_read_worker: LatencyReadWorker | None = None
+        self._config_probe_worker: ConfigProbeWorker | None = None
         self._all_workers: list = []
 
         # Wire the cross-thread notification signals
@@ -2440,6 +2719,8 @@ class PatchBayWindow(QMainWindow):
         self._table.sync(devices)
         self._clock_tab.sync(devices)
         self._start_clock_refresh()
+        self._start_latency_read()
+        self._start_config_probe()
 
     def _on_discovered(self, devices: dict):
         import time as _time
@@ -2449,6 +2730,8 @@ class PatchBayWindow(QMainWindow):
         self._table.load(devices)
         self._clock_tab.load(devices)
         self._start_clock_refresh()
+        self._start_latency_read()
+        self._start_config_probe()
         tx = sum(1 for d in devices.values() if d.tx_channels)
         rx = sum(1 for d in devices.values() if d.rx_channels)
         self._show_status(
@@ -2471,6 +2754,38 @@ class PatchBayWindow(QMainWindow):
         w = ClockRefreshWorker(self._clock_tab.devices)
         w.done.connect(self._clock_tab.sync)
         self._clock_worker = w
+        self._all_workers.append(w)
+        w.start()
+
+    def _start_latency_read(self):
+        """Kick off a background ARC query to populate device.latency for all devices.
+
+        discover_and_populate() does not query latency via ARC — it relies on
+        the mDNS latency_ns TXT record which is often absent.  This worker
+        sends an ARC device-settings request to every device and writes the
+        result back into device.latency (nanoseconds) so the latency combo
+        pre-selects the correct value.
+        """
+        if self._lat_read_worker is not None and self._lat_read_worker.isRunning():
+            print("[latency-read] skipped — worker already running")
+            return
+        print("[latency-read] launching LatencyReadWorker")
+        w = LatencyReadWorker(self._clock_tab.devices)
+        w.done.connect(self._clock_tab.sync)
+        self._lat_read_worker = w
+        self._all_workers.append(w)
+        w.start()
+
+    def _start_config_probe(self):
+        """Run the slow notification-based probes (CONMON, interface, preferred
+        leader, AES67) in the background after the patch tab is already visible."""
+        if self._config_probe_worker is not None and self._config_probe_worker.isRunning():
+            print("[config-probe] skipped — worker already running", flush=True)
+            return
+        print("[config-probe] launching ConfigProbeWorker", flush=True)
+        w = ConfigProbeWorker(self._clock_tab.devices)
+        w.done.connect(self._clock_tab.sync)
+        self._config_probe_worker = w
         self._all_workers.append(w)
         w.start()
 
